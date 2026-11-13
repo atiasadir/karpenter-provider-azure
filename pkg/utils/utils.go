@@ -81,6 +81,10 @@ func VMResourceIDToProviderID(ctx context.Context, id string) string {
 	return providerIDLowerRG
 }
 
+func GenerateVMName(nodeClaimName string) string {
+	return fmt.Sprintf("aks-%s", nodeClaimName)
+}
+
 // WithDefaultFloat64 returns the float64 value of the supplied environment variable or, if not present,
 // the supplied default value. If the float64 conversion fails, returns the default
 func WithDefaultFloat64(key string, def float64) float64 {

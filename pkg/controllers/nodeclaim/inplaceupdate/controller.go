@@ -40,6 +40,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
 )
@@ -63,6 +64,9 @@ func NewController(
 }
 
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim) (reconcile.Result, error) {
+	if nodeClaim.Annotations[flex.PoolAnnotation] != "" {
+		return reconcile.Result{}, nil
+	}
 	ctx = injection.WithControllerName(ctx, "nodeclaim.inplaceupdate")
 	// No need to add nodeClaim name to the context as it's already there
 

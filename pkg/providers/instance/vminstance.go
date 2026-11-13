@@ -25,6 +25,7 @@ import (
 	"time"
 
 	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
@@ -46,6 +47,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
@@ -140,6 +142,14 @@ type VirtualMachinePromise struct {
 }
 
 func (p *VirtualMachinePromise) Cleanup(ctx context.Context) error {
+	if p.nodeClaim != nil && p.nodeClaim.Annotations[flex.PoolAnnotation] != "" {
+		poolID := p.nodeClaim.Annotations[flex.PoolAnnotation]
+		if err := p.providerRef.cleanupFlexResources(ctx, poolID, lo.FromPtr(p.VM.Name)); err != nil {
+			return err
+		}
+		p.providerRef.quotaLifecycle.recordDelete(p.nodeClaim, p.quotaMetadata)
+		return nil
+	}
 	// This won't clean up leaked NICs if the VM doesn't exist... intentional?
 	// From Delete(): "Leftover network interfaces (if any) will be cleaned by by GC controller"
 	// Still, we could try to DeleteNic()?
@@ -158,6 +168,8 @@ func (p *VirtualMachinePromise) GetInstanceName() string {
 }
 
 type VMProvider interface {
+	PrepareFlex(context.Context, *v1beta1.AKSNodeClass, *karpv1.NodeClaim) (map[string]string, error)
+	FlexMetadata(context.Context, *armcompute.VirtualMachine) (map[string]string, error)
 	BeginCreate(context.Context, *v1beta1.AKSNodeClass, *karpv1.NodeClaim, []*corecloudprovider.InstanceType) (*VirtualMachinePromise, error)
 	Get(context.Context, string) (*armcompute.VirtualMachine, error)
 	List(context.Context) ([]*armcompute.VirtualMachine, error)
@@ -246,9 +258,15 @@ func (p *DefaultVMProvider) BeginCreate(
 	nodeClaim *karpv1.NodeClaim,
 	instanceTypes []*corecloudprovider.InstanceType,
 ) (*VirtualMachinePromise, error) {
+	if err := validateFlexCreationOwnership(ctx, nodeClass, nodeClaim); err != nil {
+		return nil, err
+	}
 	quotaGeneration := p.quotaLifecycle.snapshotGeneration()
 	vmPromise, err := p.beginLaunchInstance(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
+		if poolID := nodeClaim.Annotations[flex.PoolAnnotation]; poolID != "" {
+			return nil, errors.Join(err, p.cleanupFlexResources(ctx, poolID, GenerateResourceName(nodeClaim.Name)))
+		}
 		// There may be orphan NICs (created before promise started)
 		// This err block is hit only for sync failures. Async (VM provisioning) failures will be returned by the vmPromise.Wait() function
 		if cleanupErr := p.cleanupAzureResources(ctx, GenerateResourceName(nodeClaim.Name), true); cleanupErr != nil {
@@ -382,6 +400,16 @@ func (p *DefaultVMProvider) List(ctx context.Context) ([]*armcompute.VirtualMach
 }
 
 func (p *DefaultVMProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim, resourceName string) error {
+	if poolID := nodeClaim.Annotations[flex.PoolAnnotation]; poolID != "" {
+		if nodeClaim.Status.ProviderID != "" && nodeClaim.Status.ProviderID != nodeClaim.Annotations[flex.ProviderIDAnnotation] {
+			return fmt.Errorf("flex NodeClaim provider ID does not match its creation-time ownership")
+		}
+		if err := p.cleanupFlexResources(ctx, poolID, resourceName); err != nil {
+			return err
+		}
+		p.quotaLifecycle.recordDeleteFromNodeClaim(ctx, nodeClaim)
+		return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("flex worker resources have been deleted"))
+	}
 	gone, err := p.deleteImpl(ctx, resourceName)
 	if gone {
 		p.quotaLifecycle.recordDeleteFromNodeClaim(ctx, nodeClaim)
@@ -553,7 +581,7 @@ func (p *DefaultVMProvider) newNetworkInterfaceForVM(opts *createNICOptions) arm
 
 // E.g., aks-default-2jf98
 func GenerateResourceName(nodeClaimName string) string {
-	return fmt.Sprintf("aks-%s", nodeClaimName)
+	return utils.GenerateVMName(nodeClaimName)
 }
 
 type createNICOptions struct {
@@ -658,6 +686,15 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	setVMPropertiesOSDiskType(vm.Properties, opts.LaunchTemplate)
 	setVMPropertiesOSDiskEncryption(vm.Properties, opts.DiskEncryptionSetID)
 	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
+	if opts.NodeClass.Spec.Flex != nil {
+		vm.Properties.StorageProfile.ImageReference = &armcompute.ImageReference{
+			Publisher: lo.ToPtr(flex.HostImagePublisher),
+			Offer:     lo.ToPtr(flex.HostImageOffer),
+			SKU:       lo.ToPtr(flex.HostImageSKU),
+			Version:   lo.ToPtr(opts.NodeClass.Spec.Flex.HostImageVersion),
+		}
+		vm.Identity = ConvertToVirtualMachineIdentity([]string{opts.NodeClass.Spec.Flex.IdentityID})
+	}
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
 	setVMPropertiesAdditionalCapabilities(vm.Properties, opts.UltraSSDEnabled, opts.LaunchTemplate.EnableFIPS1403Encryption)
@@ -914,25 +951,29 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		return nil, fmt.Errorf("getting launch template: %w", err)
 	}
 
-	backendPools, err := p.loadBalancerProvider.LoadBalancerBackendPools(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting backend pools: %w", err)
-	}
-	backendPools = filterBackendPools(backendPools, nodeClaim)
+	backendPools := &loadbalancer.BackendAddressPools{}
 	networkPlugin := options.FromContext(ctx).NetworkPlugin
 	networkPluginMode := options.FromContext(ctx).NetworkPluginMode
-
-	isAKSManagedVNET, err := utils.IsAKSManagedVNET(options.FromContext(ctx).NodeResourceGroup, launchTemplate.SubnetID)
-	if err != nil {
-		return nil, fmt.Errorf("checking if vnet is managed: %w", err)
-	}
 	var nsgID string
-	if !isAKSManagedVNET {
-		nsg, err := p.networkSecurityGroupProvider.ManagedNetworkSecurityGroup(ctx)
+	if nodeClass.Spec.Flex == nil {
+		backendPools, err = p.loadBalancerProvider.LoadBalancerBackendPools(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("getting managed network security group: %w", err)
+			return nil, fmt.Errorf("getting backend pools: %w", err)
 		}
-		nsgID = lo.FromPtr(nsg.ID)
+		backendPools = filterBackendPools(backendPools, nodeClaim)
+		isAKSManagedVNET, err := utils.IsAKSManagedVNET(options.FromContext(ctx).NodeResourceGroup, launchTemplate.SubnetID)
+		if err != nil {
+			return nil, fmt.Errorf("checking if vnet is managed: %w", err)
+		}
+		if !isAKSManagedVNET {
+			nsg, err := p.networkSecurityGroupProvider.ManagedNetworkSecurityGroup(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("getting managed network security group: %w", err)
+			}
+			nsgID = lo.FromPtr(nsg.ID)
+		}
+	} else {
+		networkPlugin = consts.NetworkPluginNone
 	}
 
 	// TODO: Not returning after launching this LRO because
@@ -1052,7 +1093,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 					return err
 				}
 			}
-			if isAKSIdentifyingExtensionEnabled(p.env) {
+			if nodeClass.Spec.Flex == nil && isAKSIdentifyingExtensionEnabled(p.env) {
 				err = p.createAKSIdentifyingExtension(ctx, resourceName, launchTemplate.Tags)
 				if err != nil {
 					return err
@@ -1103,6 +1144,14 @@ func (p *DefaultVMProvider) getLaunchTemplate(
 	launchTemplate, err := p.launchTemplateProvider.GetTemplate(ctx, nodeClass, nodeClaim, instanceType, additionalLabels)
 	if err != nil {
 		return nil, fmt.Errorf("getting launch templates, %w", err)
+	}
+	if nodeClass.Spec.Flex != nil {
+		pool, err := arm.ParseResourceID(nodeClaim.Annotations[flex.PoolAnnotation])
+		if err != nil {
+			return nil, fmt.Errorf("parsing creation-time Flex pool: %w", err)
+		}
+		launchTemplate.Tags[flex.PoolTag] = lo.ToPtr(pool.Name)
+		launchTemplate.Tags[flex.SpecHashTag] = lo.ToPtr(nodeClaim.Annotations[flex.SpecHashAnnotation])
 	}
 
 	return launchTemplate, nil

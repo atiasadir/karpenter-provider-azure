@@ -28,6 +28,7 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 
@@ -198,6 +199,9 @@ func (c *CloudProvider) isImageVersionDrifted(
 
 // isKubeletIdentityDrifted returns drift if the kubelet identity has drifted
 func (c *CloudProvider) isKubeletIdentityDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, _ *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
+	if nodeClaim.Annotations[flex.PoolAnnotation] != "" {
+		return "", nil
+	}
 	opts := options.FromContext(ctx)
 	logger := log.FromContext(ctx)
 

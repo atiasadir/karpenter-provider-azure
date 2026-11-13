@@ -72,6 +72,43 @@ type CapacityReservationConfiguration struct {
 	GroupID *string `json:"groupID,omitempty"`
 }
 
+// FlexNodeConfiguration opts into customer-managed Flex workers. The Flex pool,
+// identity, subnet, and cross-site networking are provisioned outside Karpenter.
+type FlexNodeConfiguration struct {
+	// agentPoolID identifies an existing FlexNodes pool in this AKS cluster.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ContainerService/managedClusters/[^/]+/agentPools/[a-z][a-z0-9]{0,11}$`
+	// +required
+	AgentPoolID string `json:"agentPoolID,omitempty"`
+	// identityID is a preauthorized user-assigned identity attached to each host.
+	// It must have the Flex Node Agent Role at agentPoolID.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$`
+	// +required
+	IdentityID string `json:"identityID,omitempty"`
+	// identityClientID selects identityID when the host requests bootstrap data.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Format=uuid
+	// +required
+	IdentityClientID string `json:"identityClientID,omitempty"`
+	// hostImageVersion pins the Canonical ubuntu-24_04-lts/server marketplace
+	// image used for the amd64 host. "latest" is deliberately not accepted.
+	// The Flex pool separately owns the worker's Kubernetes component version.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[0-9]+\.[0-9]+\.[0-9]+$`
+	// +required
+	HostImageVersion string `json:"hostImageVersion,omitempty"`
+}
+
+func (in *FlexNodeConfiguration) normalizeForHash() {
+	if in == nil {
+		return
+	}
+	in.AgentPoolID = strings.ToLower(in.AgentPoolID)
+	in.IdentityID = strings.ToLower(in.IdentityID)
+	in.IdentityClientID = strings.ToLower(in.IdentityClientID)
+}
+
 // NodePublicIP configures an instance-level public IP address for each node
 // provisioned by this NodeClass.
 // +kubebuilder:validation:XValidation:message="nodePublicIP.prefixIDs requires nodePublicIP.enabled to be true",rule="!has(self.prefixIDs) || (has(self.enabled) && self.enabled)"
@@ -164,6 +201,12 @@ type AKSNodeClassSpec struct {
 	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
 	// +optional
 	VNETSubnetID *string `json:"vnetSubnetID,omitempty"`
+	// flex opts into external Flex workers in a precreated same-region subnet.
+	// Requires enable-flex-nodes, aksscriptless mode, and an AKS cluster created
+	// with networkPlugin=none. Managed Azure CNI clusters cannot enroll Flex nodes.
+	// Omit this field to preserve native AKS provisioning.
+	// +optional
+	Flex *FlexNodeConfiguration `json:"flex,omitempty"`
 	// capacityReservation configures the Capacity Reservation Group that instances
 	// provisioned by this NodeClass target.
 	// +optional
@@ -991,6 +1034,7 @@ const AKSNodeClassHashVersion = "v3"
 
 func (in *AKSNodeClass) Hash() string {
 	spec := in.Spec.DeepCopy()
+	spec.Flex.normalizeForHash()
 	if spec.CapacityReservation != nil {
 		spec.CapacityReservation.GroupID = lo.ToPtr(strings.ToLower(lo.FromPtr(spec.CapacityReservation.GroupID)))
 	}

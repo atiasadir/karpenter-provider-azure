@@ -49,6 +49,7 @@ type OptionsFields struct {
 	EnableAzureSDKLogging          *bool
 	DiskEncryptionSetID            *string
 	EnableFIPS                     *bool
+	EnableFlexNodes                *bool
 	ClusterDNSServiceIP            *string
 	ManageExistingAKSMachines      *bool
 	AKSMachinesPoolName            *string
@@ -97,6 +98,7 @@ func Options(overrides ...OptionsFields) *azoptions.Options {
 		AdditionalTags:                 options.AdditionalTags,
 		DiskEncryptionSetID:            lo.FromPtrOr(options.DiskEncryptionSetID, ""),
 		EnableFIPS:                     lo.FromPtrOr(options.EnableFIPS, false),
+		EnableFlexNodes:                lo.FromPtrOr(options.EnableFlexNodes, false),
 		DNSServiceIP:                   lo.FromPtrOr(options.ClusterDNSServiceIP, ""),
 		ManageExistingAKSMachines:      lo.FromPtrOr(options.ManageExistingAKSMachines, false),
 		AKSMachinesPoolName:            lo.FromPtrOr(options.AKSMachinesPoolName, "aksmanagedap"),

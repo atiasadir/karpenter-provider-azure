@@ -113,6 +113,9 @@ func (r *NodeImageReconciler) Register(_ context.Context, m manager.Manager) err
 //
 //nolint:gocyclo // Keep the established automatic image update flow together; pinning is isolated in helpers below.
 func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
+	if nodeClass.Spec.Flex != nil {
+		return reconcile.Result{}, nil
+	}
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithName(nodeImageReconcilerName))
 	logger := log.FromContext(ctx)
 

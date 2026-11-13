@@ -31,6 +31,7 @@ const (
 	ConditionTypeSubnetsReady           = "SubnetsReady"
 	ConditionTypeValidationSucceeded    = "ValidationSucceeded"
 	ConditionTypeLocalDNSReady          = "LocalDNSReady"
+	ConditionTypeFlexReady              = "FlexReady"
 	// ConditionTypeCapacityReservationGroupReady is only a dependent of the Ready
 	// condition when spec.capacityReservation.groupID is set.
 	ConditionTypeCapacityReservationGroupReady = "CapacityReservationGroupReady"
@@ -218,6 +219,9 @@ func (in *AKSNodeClass) StatusConditions(opts ...status.ForOption) status.Condit
 	// so NodeClasses that do not use the feature are unaffected by it.
 	if in.Spec.CapacityReservation != nil {
 		conds = append(conds, ConditionTypeCapacityReservationGroupReady)
+	}
+	if in.Spec.Flex != nil {
+		conds = append(conds, ConditionTypeFlexReady)
 	}
 	return status.NewReadyConditions(conds...).For(in, opts...)
 }

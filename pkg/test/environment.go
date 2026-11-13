@@ -108,6 +108,7 @@ type Environment struct {
 	UnavailableOfferingsCache   *azurecache.UnavailableOfferings
 
 	// Providers
+	AZClient                     *azclient.AZClient
 	InstanceTypesProvider        *instancetype.DefaultProvider
 	VMInstanceProvider           instance.VMProvider
 	AKSMachineProvider           instance.AKSMachineProvider
@@ -335,6 +336,7 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 	networkSecurityGroupAPI.NSGs.Store(lo.FromPtr(nsg.ID), nsg)
 
 	return &Environment{
+		AZClient:                        azClient,
 		VirtualMachinesAPI:              virtualMachinesAPI,
 		AuxiliaryTokenServer:            auxiliaryTokenServer,
 		AzureResourceGraphAPI:           azureResourceGraphAPI,

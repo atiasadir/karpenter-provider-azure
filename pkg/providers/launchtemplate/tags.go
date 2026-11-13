@@ -23,6 +23,7 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/samber/lo"
 )
 
@@ -61,7 +62,10 @@ func Tags(
 	nodeClassTags := lo.MapEntries(nodeClass.Spec.Tags, mapTags)
 	defaultTagsMapped := lo.MapEntries(defaultTags, mapTags)
 
-	return lo.Assign(additionalTags, nodeClassTags, defaultTagsMapped)
+	tags := lo.Assign(additionalTags, nodeClassTags, defaultTagsMapped)
+	delete(tags, flex.PoolTag)
+	delete(tags, flex.SpecHashTag)
+	return tags
 }
 
 func mapTags(key string, value string) (string, *string) {

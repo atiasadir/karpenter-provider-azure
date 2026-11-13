@@ -18,6 +18,7 @@ package status_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -27,9 +28,11 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	"github.com/blang/semver/v4"
@@ -67,7 +70,7 @@ var _ = BeforeSuite(func() {
 	azureEnv = test.NewEnvironment(ctx, env)
 
 	controller = status.NewController(env.Client, azureEnv.SubscriptionID, fake.Region, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin,
-		azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI, azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace)
+		azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI, azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace, azureEnv.AZClient.Flex)
 })
 
 var _ = AfterSuite(func() {
@@ -89,4 +92,73 @@ var _ = BeforeEach(func() {
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 	expectations.ExpectCleanUp(ctx, env.Client)
+})
+
+var _ = Describe("Flex readiness", func() {
+	var flexCtx context.Context
+	var reconciler *status.FlexReconciler
+
+	BeforeEach(func() {
+		flexCtx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			EnableFlexNodes: lo.ToPtr(true),
+			NetworkPlugin:   lo.ToPtr(consts.NetworkPluginNone),
+		}))
+		test.WithFlex(azureEnv.SubscriptionID, options.FromContext(flexCtx).ClusterName)(nodeClass)
+		test.ApplyDefaultStatus(nodeClass, env, false)
+		test.ConfigureFlex(flexCtx, azureEnv, nodeClass)
+		reconciler = status.NewFlexReconciler(azureEnv.AZClient.Flex)
+	})
+
+	It("should resolve the host image and permit an explicit external subnet", func() {
+		_, err := reconciler.Reconcile(flexCtx, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		_, err = status.NewSubnetReconciler(azureEnv.SubnetsAPI).Reconcile(flexCtx, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeFlexReady).IsTrue()).To(BeTrue())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady).IsTrue()).To(BeTrue())
+		Expect(nodeClass.Status.Images).To(HaveLen(1))
+		Expect(nodeClass.Status.Images[0].ID).To(Equal("Canonical:ubuntu-24_04-lts:server:" + test.FlexHostImageVersion))
+	})
+
+	It("should retain the native VNet boundary when the feature is disabled", func() {
+		disabled := options.ToContext(ctx, test.Options())
+		_, err := reconciler.Reconcile(disabled, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeFlexReady).Reason).To(Equal("FlexNodesDisabled"))
+		_, err = status.NewSubnetReconciler(azureEnv.SubnetsAPI).Reconcile(disabled, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady).IsFalse()).To(BeTrue())
+	})
+
+	It("should not create or call Flex clients for a native NodeClass", func() {
+		nodeClass.Spec.Flex = nil
+		reconciler = status.NewFlexReconciler(func() (*flex.Provider, error) {
+			Fail("native readiness must not initialize Flex clients")
+			return nil, nil
+		})
+		_, err := reconciler.Reconcile(flexCtx, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should reject managed CNI even when Flex is enabled", func() {
+		managedCtx := options.ToContext(ctx, test.Options(test.OptionsFields{EnableFlexNodes: lo.ToPtr(true)}))
+		_, err := reconciler.Reconcile(managedCtx, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeFlexReady).Reason).To(Equal("FlexRequiresNoCNICluster"))
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsFalse()).To(BeTrue())
+	})
+
+	It("should retain image history but revoke readiness when the provider fails", func() {
+		_, err := reconciler.Reconcile(flexCtx, nodeClass)
+		Expect(err).ToNot(HaveOccurred())
+		images := nodeClass.DeepCopy().Status.Images
+		reconciler = status.NewFlexReconciler(func() (*flex.Provider, error) {
+			return nil, fmt.Errorf("simulated Azure client failure")
+		})
+		_, err = reconciler.Reconcile(flexCtx, nodeClass)
+		Expect(err).To(HaveOccurred())
+		Expect(nodeClass.Status.Images).To(Equal(images))
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeFlexReady).IsFalse()).To(BeTrue())
+		Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsFalse()).To(BeTrue())
+	})
 })

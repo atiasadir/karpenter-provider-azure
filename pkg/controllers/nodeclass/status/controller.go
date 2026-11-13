@@ -37,6 +37,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/kubernetesversion"
 	"github.com/awslabs/operatorpkg/reasonable"
@@ -56,6 +57,7 @@ type Controller struct {
 	validation               *StaticValidationReconciler
 	localDNS                 *LocalDNSReconciler
 	capacityReservationGroup *CapacityReservationGroupReconciler
+	flex                     *FlexReconciler
 }
 
 // TODO: Consider splitting this (and other similar constructors)
@@ -79,6 +81,7 @@ func NewController(
 	instanceTypes instanceTypeLister,
 	unavailableOfferings capacityReservationGroupOfferingsInvalidator,
 	systemNamespace string,
+	flexProvider func() (*flex.Provider, error),
 ) *Controller {
 	return &Controller{
 
@@ -90,6 +93,7 @@ func NewController(
 		validation:               NewStaticValidationReconciler(diskEncryptionSetsClient, parsedDiskEncryptionSetID),
 		localDNS:                 NewLocalDNSReconciler(managedKubernetesInterface, managedDynamicInterface, networkPolicy, networkPlugin),
 		capacityReservationGroup: NewCapacityReservationGroupReconciler(subscriptionID, location, capacityReservationGroupsClient, capacityReservationsClient, instanceTypes, unavailableOfferings),
+		flex:                     NewFlexReconciler(flexProvider),
 	}
 }
 
@@ -114,6 +118,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeCl
 		c.validation,
 		c.localDNS,
 		c.capacityReservationGroup,
+		c.flex,
 	}
 	for _, reconciler := range reconcilers {
 		res, err := reconciler.Reconcile(ctx, nodeClass)

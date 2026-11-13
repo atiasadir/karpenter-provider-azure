@@ -28,6 +28,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
@@ -132,6 +133,7 @@ func NewStaticValidationReconciler(
 func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	validators := []validator{
 		r.validateKubernetesVersion,
+		r.validateFlexConfiguration,
 		r.validateFIPS,
 		r.validateACLConfiguration,
 		r.validateWindowsCompatibility,
@@ -163,6 +165,17 @@ func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v
 	// All validations passed - requeue to detect permission revocations
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeValidationSucceeded)
 	return reconcile.Result{RequeueAfter: ValidationSuccessRequeueInterval}, nil
+}
+
+func (r *StaticValidationReconciler) validateFlexConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (validationResult, error) {
+	if err := flex.ValidateConfiguration(ctx, nodeClass); err != nil {
+		var configError *flex.ConfigurationError
+		if errors.As(err, &configError) {
+			return fail(configError.Reason, configError.Message), nil
+		}
+		return validationResult{}, err
+	}
+	return pass(), nil
 }
 
 // Validates the Kubernetes version from AKSNodeClass to catch problems early before other validators

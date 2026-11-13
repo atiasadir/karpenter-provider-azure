@@ -19,12 +19,14 @@ package cloudprovider
 // TODO v1beta1 extra refactor into suite_test.go / cloudprovider_test.go
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	"github.com/Azure/skewer"
 	"github.com/awslabs/operatorpkg/object"
@@ -61,6 +63,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
@@ -90,6 +93,14 @@ var nodeClaim *karpv1.NodeClaim
 
 var fakeZone1 = zones.MakeAKSLabelZoneFromARMZone(fake.Region, "1")
 var defaultTestSKU = fake.MakeSKU("Standard_D2_v3")
+
+type flexPatchFailureClient struct {
+	client.Client
+}
+
+func (c flexPatchFailureClient) Patch(context.Context, client.Object, client.Patch, ...client.PatchOption) error {
+	return fmt.Errorf("simulated ownership persistence failure")
+}
 
 func TestCloudProvider(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -467,6 +478,150 @@ var _ = Describe("CloudProvider", func() {
 			Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(0))
 		})
 
+		Context("Flex workers", func() {
+			BeforeEach(func() {
+				nodeClaim.Status = karpv1.NodeClaimStatus{}
+				testOptions.EnableFlexNodes = true
+				testOptions.NetworkPlugin = consts.NetworkPluginNone
+				test.WithFlex(azureEnv.SubscriptionID, testOptions.ClusterName)(nodeClass)
+				provider := test.ConfigureFlex(ctx, azureEnv, nodeClass)
+				image, err := provider.Resolve(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				nodeClass.Status.Images = []v1beta1.NodeImage{image}
+				nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeFlexReady)
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			})
+
+			It("should create an external host without native cluster networking or bootstrap", func() {
+				created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created.Status.ImageID).To(Equal(nodeClass.Status.Images[0].ID))
+				drift, err := cloudProvider.isImageVersionDrifted(ctx, created, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(drift).To(BeEmpty())
+				vmName := instance.GenerateResourceName(nodeClaim.Name)
+				vm, err := azureEnv.VMInstanceProvider.Get(ctx, vmName)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vm.Properties.StorageProfile.ImageReference.Publisher).To(Equal(lo.ToPtr(flex.HostImagePublisher)))
+				Expect(vm.Properties.StorageProfile.ImageReference.Version).To(Equal(lo.ToPtr(test.FlexHostImageVersion)))
+				Expect(vm.Identity.UserAssignedIdentities).To(HaveLen(1))
+				Expect(vm.Identity.UserAssignedIdentities).To(HaveKey(nodeClass.Spec.Flex.IdentityID))
+				Expect(vm.Tags[flex.PoolTag]).To(Equal(lo.ToPtr(test.FlexPoolName)))
+				data, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(data)).To(ContainSubstring(created.Status.ProviderID))
+				nic, err := azureEnv.VMInstanceProvider.GetNic(ctx, testOptions.NodeResourceGroup, vmName)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nic.Properties.NetworkSecurityGroup).To(BeNil())
+				Expect(nic.Properties.IPConfigurations).To(HaveLen(1))
+				ip := nic.Properties.IPConfigurations[0].Properties
+				Expect(ip.Subnet.ID).To(Equal(nodeClass.Spec.VNETSubnetID))
+				Expect(ip.LoadBalancerBackendAddressPools).To(BeEmpty())
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+				Expect(nodeClaim.Finalizers).To(ContainElement(flex.TerminationFinalizer))
+				Expect(nodeClaim.Annotations[flex.PoolAnnotation]).To(Equal(nodeClass.Spec.Flex.AgentPoolID))
+				Expect(nodeClaim.Annotations[flex.ProviderIDAnnotation]).To(Equal(created.Status.ProviderID))
+			})
+
+			It("should persist ownership before any Azure creation and retry a failed patch", func() {
+				cloudProvider.kubeClient = flexPatchFailureClient{Client: env.Client}
+				_, err := cloudProvider.Create(ctx, nodeClaim)
+				Expect(err).To(MatchError(ContainSubstring("persisting Flex enrollment ownership")))
+				Expect(nodeClaim.Annotations).ToNot(HaveKey(flex.PoolAnnotation))
+				Expect(nodeClaim.Finalizers).ToNot(ContainElement(flex.TerminationFinalizer))
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+				Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.Calls()).To(BeZero())
+				cloudProvider.kubeClient = env.Client
+				_, err = CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+				Expect(nodeClaim.Annotations[flex.PoolAnnotation]).To(Equal(nodeClass.Spec.Flex.AgentPoolID))
+			})
+
+			It("should reject stale readiness when the feature is disabled", func() {
+				testOptions.EnableFlexNodes = false
+				_, err := cloudProvider.Create(ctx, nodeClaim)
+				Expect(err).To(HaveOccurred())
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+				Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.Calls()).To(BeZero())
+			})
+
+			It("should reject a managed CNI cluster before any external worker creation", func() {
+				testOptions.NetworkPlugin = consts.NetworkPluginAzure
+				testOptions.NetworkPluginMode = consts.NetworkPluginModeOverlay
+				_, err := cloudProvider.Create(ctx, nodeClaim)
+				Expect(err).To(MatchError(ContainSubstring("networkPlugin=none")))
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+				Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.Calls()).To(BeZero())
+			})
+
+			It("should not change creation-time configuration on a retry", func() {
+				Expect(cloudProvider.recordFlexOwnership(ctx, nodeClass, nodeClaim)).To(Succeed())
+				originalPool := nodeClaim.Annotations[flex.PoolAnnotation]
+				nodeClass.Spec.Flex.HostImageVersion = "24.04.202611020"
+				nodeClass.Status.Images[0].ID = "Canonical:ubuntu-24_04-lts:server:" + nodeClass.Spec.Flex.HostImageVersion
+				Expect(cloudProvider.recordFlexOwnership(ctx, nodeClass, nodeClaim)).To(MatchError(ContainSubstring("creation-time ownership differs")))
+				Expect(nodeClaim.Annotations[flex.PoolAnnotation]).To(Equal(originalPool))
+				Expect(nodeClaim.Annotations[flex.SpecHashAnnotation]).ToNot(Equal(nodeClass.Hash()))
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+			})
+
+			DescribeTable("should delete the original enrollment after the NodeClass is changed",
+				func(removeClass bool) {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					vmName := instance.GenerateResourceName(nodeClaim.Name)
+					owned := fake.MkMachineID("test-cluster-resource-group", testOptions.ClusterName, test.FlexPoolName, vmName)
+					other := fake.MkMachineID("test-cluster-resource-group", testOptions.ClusterName, "replacement", vmName)
+					azureEnv.AKSDataStorage.AKSMachines.Store(owned, armcontainerservice.Machine{})
+					azureEnv.AKSDataStorage.AKSMachines.Store(other, armcontainerservice.Machine{})
+					if removeClass {
+						Expect(env.Client.Delete(ctx, nodeClass)).To(Succeed())
+					} else {
+						nodeClass.Spec.Flex = nil
+						ExpectApplied(ctx, env.Client, nodeClass)
+					}
+					testOptions.EnableFlexNodes = false
+					recovered, err := cloudProvider.Get(ctx, created.Status.ProviderID)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(recovered.Annotations[flex.PoolAnnotation]).To(Equal(created.Annotations[flex.PoolAnnotation]))
+					Expect(recovered.Annotations[flex.SpecHashAnnotation]).To(Equal(created.Annotations[flex.SpecHashAnnotation]))
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, recovered))).To(BeTrue())
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, created))).To(BeTrue())
+					_, err = azureEnv.VMInstanceProvider.Get(ctx, vmName)
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
+					_, exists := azureEnv.NetworkInterfacesAPI.NetworkInterfaces.Load(fake.MakeNetworkInterfaceID(testOptions.NodeResourceGroup, vmName))
+					Expect(exists).To(BeFalse())
+					_, exists = azureEnv.AKSDataStorage.AKSMachines.Load(owned)
+					Expect(exists).To(BeFalse())
+					_, exists = azureEnv.AKSDataStorage.AKSMachines.Load(other)
+					Expect(exists).To(BeTrue())
+					_, exists = azureEnv.AKSDataStorage.AgentPools.Load(fake.MkAgentPoolID("test-cluster-resource-group", testOptions.ClusterName, test.FlexPoolName))
+					Expect(exists).To(BeTrue())
+					Expect(azureEnv.AKSAgentPoolsAPI.AgentPoolDeleteMachinesBehavior.Calls()).To(Equal(1))
+				},
+				Entry("removed configuration", false),
+				Entry("deleted NodeClass", true),
+			)
+
+			It("should retain failed-launch cleanup intent and remove a partial enrollment", func() {
+				vmName := instance.GenerateResourceName(nodeClaim.Name)
+				owned := fake.MkMachineID("test-cluster-resource-group", testOptions.ClusterName, test.FlexPoolName, vmName)
+				azureEnv.AKSDataStorage.AKSMachines.Store(owned, armcontainerservice.Machine{})
+				azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.BeginError.Set(fmt.Errorf("simulated create failure"))
+				_, err := cloudProvider.Create(ctx, nodeClaim)
+				Expect(err).To(HaveOccurred())
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+				Expect(nodeClaim.Status.ProviderID).To(BeEmpty())
+				Expect(nodeClaim.Finalizers).To(ContainElement(flex.TerminationFinalizer))
+				Expect(nodeClaim.Annotations[flex.PoolAnnotation]).To(Equal(nodeClass.Spec.Flex.AgentPoolID))
+				_, exists := azureEnv.NetworkInterfacesAPI.NetworkInterfaces.Load(fake.MakeNetworkInterfaceID(testOptions.NodeResourceGroup, vmName))
+				Expect(exists).To(BeFalse())
+				_, exists = azureEnv.AKSDataStorage.AKSMachines.Load(owned)
+				Expect(exists).To(BeFalse())
+			})
+		})
+
 		It("should reject managed GPU before creating a VM on an unsupported provision mode", func() {
 			nodeClass.Spec.GPU = &v1beta1.GPU{
 				Mode: lo.ToPtr(v1beta1.GPUModeDriver),
@@ -475,7 +630,7 @@ var _ = Describe("CloudProvider", func() {
 				},
 			}
 			statusController = status.NewController(env.Client, azureEnv.SubscriptionID, fake.Region, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin,
-				azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI, azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace)
+				azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI, azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace, azureEnv.AZClient.Flex)
 
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, statusController, nodeClass)

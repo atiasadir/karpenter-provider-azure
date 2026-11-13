@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
@@ -77,7 +78,7 @@ func (r *SubnetReconciler) validateVNETSubnetID(ctx context.Context, nodeClass *
 		)
 		return reconcile.Result{}, nil
 	}
-	if subnetID != clusterSubnetID {
+	if requiresClusterVNET(ctx, nodeClass, subnetID, clusterSubnetID) {
 		clusterSubnetIDParts, err := utils.GetVnetSubnetIDComponents(clusterSubnetID) // Assume valid cluster subnet id
 		if err != nil {                                                               // Highly unlikely case but putting it in nonetheless
 			logger.Error(err, "failed to parse cluster subnet ID", "clusterSubnetID", clusterSubnetID)
@@ -135,4 +136,8 @@ func (r *SubnetReconciler) validateVNETSubnetID(ctx context.Context, nodeClass *
 
 	// Periodically requeue just in case subnet has been removed or later revalidating things like fullness etc
 	return reconcile.Result{RequeueAfter: healthyRequeueInterval}, nil
+}
+
+func requiresClusterVNET(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, subnetID, clusterSubnetID string) bool {
+	return subnetID != clusterSubnetID && (nodeClass.Spec.Flex == nil || flex.ValidateConfiguration(ctx, nodeClass) != nil)
 }

@@ -12,6 +12,7 @@ Table of contents:
 - [Node Auto Provisioning (NAP) vs. Self-hosted Karpenter](#node-auto-provisioning-nap-vs-self-hosted-karpenter)
 - [Node memory reservations](#node-memory-reservations)
 - [Known limitations](#known-limitations)
+- [Experimental external-VNet workers](#experimental-external-vnet-workers)
 - [Installation (self-hosted)](#installation-self-hosted-karpenter)
   - [Install utilities](#install-utilities)
   - [Create a cluster](#create-a-cluster)
@@ -80,6 +81,95 @@ The following AKS features are not supported:
 * [Service Principal](https://learn.microsoft.com/azure/aks/kubernetes-service-principal) based clusters. A system-assigned or user-assigned managed identity must be used.
 * Clusters running Karpenter should not be [stopped](https://learn.microsoft.com/azure/aks/start-stop-cluster).
 * All cluster egress [outbound types](https://learn.microsoft.com/azure/aks/egress-outboundtype) are supported, however the type can't be changed after the cluster is created.
+
+## Experimental external-VNet workers
+
+This fork contains an **experimental, default-off, same-region** Flex Node path
+for AKS clusters created with **`networkPlugin: none`**. The AKS service rejects
+FlexNodes pools on managed Azure CNI Overlay/Cilium clusters; Unbounded's generic
+existing-CNI support does not remove that enrollment requirement. This path
+cannot extend an existing managed-CNI cluster. Do not change such a cluster's
+networking to make this experiment pass.
+
+This is not a supported upstream capability and has not passed a live external
+worker lifecycle. Cross-region provisioning is rejected.
+Ordinary NodeClasses retain the native provisioning path and its existing
+same-VNet restriction; changing `vnetSubnetID` alone does not enable another VNet.
+
+The implementation targets self-hosted `aksscriptless` with `USE_SIG=false`
+and `NETWORK_PLUGIN=none`,
+CPU/amd64 hosts and `imageFamily: Ubuntu2404`. It pins
+[AKS Flex Node v0.3.0](https://github.com/Azure/AKSFlexNode/tree/4741b41e4feaaca86d0dd53014fd4a141731ea34)
+and checks bootstrap-script and agent-archive SHA256 digests before execution.
+The host uses a separately pinned Canonical Ubuntu 24.04 Gen2 marketplace image;
+the Flex pool supplies the Kubernetes bootstrap configuration. Machine API
+provisioning modes, bootstrappingclient, FIPS/node hardening, GPU settings, Kata,
+LocalDNS, Linux OS customization, artifact streaming, kubelet overrides and node
+public IPs are not supported on this path.
+
+Before opting in, predeploy and verify:
+
+1. A `FlexNodes` pool in the controller's AKS cluster, with a full Kubernetes
+   patch version and `maxPods` matching the NodeClass.
+2. A user-assigned host identity with **Azure Kubernetes Service Flex Node Agent
+   Role** scoped to that pool. The controller needs read access to the selected
+   pool, identity, VNet and image catalog; permission to attach the subnet and
+   identity; and Machine-deletion permission at the selected pool scope.
+3. An explicit subnet in the controller's subscription and region, with suitable
+   egress, API-server access and network security. VNet peering supplies underlay
+   connectivity, not Kubernetes pod or Service routing.
+4. An independently installed, version-matched CNI and cross-site network on the
+   no-CNI cluster. The pinned Flex release uses Unbounded v0.21.0. Sites require
+   disjoint pod CIDRs and verified pod, Service and kubelet-callback routing.
+   Sites, peering and network security remain predeployment responsibilities.
+   Existing managed-CNI Node objects can also lack `spec.podCIDRs`, which the
+   pinned Unbounded mesh uses for route discovery. Do not invent CIDRs, patch
+   managed Nodes, replace IPAM or weaken policy to bypass these incompatibilities.
+
+Build this fork's controller and install its matching generated CRD before setting
+`ENABLE_FLEX_NODES=true`. Released upstream images do not implement this option.
+Then explicitly configure the external NodeClass (replace every placeholder):
+
+```yaml
+apiVersion: karpenter.azure.com/v1beta1
+kind: AKSNodeClass
+metadata:
+  name: external-workers
+spec:
+  imageFamily: Ubuntu2404
+  maxPods: 110
+  vnetSubnetID: /subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<external-vnet>/subnets/<workers>
+  flex:
+    agentPoolID: /subscriptions/<subscription>/resourceGroups/<cluster-rg>/providers/Microsoft.ContainerService/managedClusters/<cluster>/agentPools/<flex-pool>
+    identityID: /subscriptions/<subscription>/resourceGroups/<identity-rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<host-identity>
+    identityClientID: <host-identity-client-id>
+    hostImageVersion: "<major>.<minor>.<build>"
+```
+
+Select an actual regional version of
+`Canonical:ubuntu-24_04-lts:server`; `latest` is rejected. Native
+`versions.nodeImageVersion` is not a Flex host-image pin. NodeClass readiness checks
+ARM prerequisites and the configured no-CNI requirement, **not** host enrollment, network connectivity or policy
+compatibility.
+
+External workers do not use native identity/tag in-place updates. Recreate an
+external worker to apply changed user tags; pool, host-identity and host-image
+changes participate in NodeClass drift instead.
+
+Creation-time pool ownership, provider ID and configuration hash are persisted on
+the NodeClaim before Azure creation. Cleanup retains that identity after the
+NodeClass changes or disappears, and remains enabled when the feature flag is
+disabled. It stops/deletes the owned VM and NIC before removing its ARM Machine;
+failed launches retain a cleanup finalizer even without `status.providerID`.
+Pools, identities, role assignments, VNets, subnets, Sites and peering are
+predeployment-owned and are never deleted by NodeClaim cleanup.
+
+Acceptance of this Flex path requires a separately approved no-CNI test cluster;
+a successful stock managed-CNI worker lifecycle does not establish Flex
+compatibility. Verify an external worker with bidirectional node/pod traffic, DNS, ClusterIP Services,
+logs/exec and repeated cleanup. Preserve fixed system capacity and use only one
+bounded external worker during this experiment. Passing local tests does not
+establish these live guarantees.
 
 ## Installation (NAP)
 

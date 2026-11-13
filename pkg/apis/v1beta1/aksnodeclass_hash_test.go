@@ -92,6 +92,38 @@ var _ = Describe("Hash", func() {
 		Entry("NodePublicIP.Enabled false pre-feature compatibility", staticHash, v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{NodePublicIP: &v1beta1.NodePublicIP{Enabled: lo.ToPtr(false)}}}),
 	)
 
+	Context("Flex", func() {
+		BeforeEach(func() {
+			nodeClass.Spec.Flex = &v1beta1.FlexNodeConfiguration{
+				AgentPoolID:      "/subscriptions/example/resourceGroups/cluster-rg/providers/Microsoft.ContainerService/managedClusters/cluster/agentPools/flex",
+				IdentityID:       "/subscriptions/example/resourceGroups/identity-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/host",
+				IdentityClientID: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+				HostImageVersion: "24.04.202611010",
+			}
+		})
+
+		It("should normalize resource identity casing without changing the original spec", func() {
+			original := nodeClass.DeepCopy()
+			hash := nodeClass.Hash()
+			Expect(nodeClass.Spec).To(Equal(original.Spec))
+			nodeClass.Spec.Flex.AgentPoolID = strings.ToUpper(nodeClass.Spec.Flex.AgentPoolID)
+			nodeClass.Spec.Flex.IdentityID = strings.ToUpper(nodeClass.Spec.Flex.IdentityID)
+			nodeClass.Spec.Flex.IdentityClientID = strings.ToLower(nodeClass.Spec.Flex.IdentityClientID)
+			Expect(nodeClass.Hash()).To(Equal(hash))
+		})
+
+		DescribeTable("should drift when creation-time enrollment changes", func(change func(*v1beta1.FlexNodeConfiguration)) {
+			hash := nodeClass.Hash()
+			change(nodeClass.Spec.Flex)
+			Expect(nodeClass.Hash()).ToNot(Equal(hash))
+		},
+			Entry("pool", func(f *v1beta1.FlexNodeConfiguration) { f.AgentPoolID += "-other" }),
+			Entry("identity", func(f *v1beta1.FlexNodeConfiguration) { f.IdentityID += "-other" }),
+			Entry("client ID", func(f *v1beta1.FlexNodeConfiguration) { f.IdentityClientID = "11111111-2222-4333-8444-555555555555" }),
+			Entry("host image", func(f *v1beta1.FlexNodeConfiguration) { f.HostImageVersion = "24.04.202611020" }),
+		)
+	})
+
 	DescribeTable("should change hash when static fields are updated", func(changes v1beta1.AKSNodeClass) {
 		hash := nodeClass.Hash()
 		Expect(mergo.Merge(nodeClass, changes, mergo.WithOverride, mergo.WithSliceDeepCopy)).To(Succeed())

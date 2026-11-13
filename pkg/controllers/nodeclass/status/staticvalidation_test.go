@@ -74,6 +74,7 @@ var _ = Describe("NodeClass Status Controller image family compatibility", func(
 				options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin,
 				azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI,
 				azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace,
+				azureEnv.AZClient.Flex,
 			)
 			pinnedNodeClass := test.AKSNodeClass(test.WithVersionBasedDefaults(env.Version))
 			pinnedNodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2404ImageFamily)

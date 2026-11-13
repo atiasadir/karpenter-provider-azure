@@ -49,6 +49,7 @@ import (
 	"github.com/samber/lo"
 
 	cloudproviderevents "github.com/Azure/karpenter-provider-azure/pkg/cloudprovider/events"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
@@ -118,6 +119,9 @@ func (c *CloudProvider) WaitForInstancePromises() {
 }
 
 func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
+	if err := flex.ValidateConfiguration(ctx, nodeClass); err != nil {
+		return cloudprovider.NewNodeClassNotReadyError(err)
+	}
 	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level"))
 	}
@@ -181,6 +185,9 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 }
 
 func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) (*karpv1.NodeClaim, error) {
+	if err := c.recordFlexOwnership(ctx, nodeClass, nodeClaim); err != nil {
+		return nil, toCreateError(err, "preparing Flex enrollment failed")
+	}
 	vmPromise, err := c.vmInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
 		return nil, toCreateError(err, "creating instance failed")
@@ -789,6 +796,9 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 	nodeClaim.Status.ProviderID = utils.VMResourceIDToProviderID(ctx, *vm.ID)
 	if vm.Properties != nil && vm.Properties.StorageProfile != nil && vm.Properties.StorageProfile.ImageReference != nil {
 		nodeClaim.Status.ImageID = utils.ImageReferenceToString(vm.Properties.StorageProfile.ImageReference)
+	}
+	if err := c.restoreFlexOwnership(ctx, vm, nodeClaim); err != nil {
+		return nil, err
 	}
 	return nodeClaim, nil
 }

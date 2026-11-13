@@ -80,6 +80,7 @@ type instanceTypeParameters struct {
 	CapacityReservationGroupID string
 	CapacityReservations       []capacityReservationPlacement
 	KataEnabled                bool
+	FlexEnabled                bool
 }
 
 // capacityReservationPlacement is one {VM size, zone} pair that a member reservation
@@ -185,6 +186,7 @@ func (p *DefaultProvider) List(
 		CapacityReservationGroupID: nodeClass.GetCapacityReservationGroupID(),
 		CapacityReservations:       p.capacityReservationPlacements(ctx, nodeClass),
 		KataEnabled:                nodeClass.IsKataEnabled(),
+		FlexEnabled:                nodeClass.Spec.Flex != nil,
 	}
 	if nodeClass.Spec.Kubelet != nil {
 		// These values do not filter SKUs, but they change scheduling simulation by changing
@@ -539,6 +541,9 @@ func (p *DefaultProvider) createOfferings(sku *skewer.SKU, offeringZones sets.Se
 // isInstanceTypeSupportedByFilters consolidates all per-NodeClass instance type
 // filters into a single call to keep the List() method's cyclomatic complexity low.
 func (p *DefaultProvider) isInstanceTypeSupportedByFilters(sku *skewer.SKU, architecture string, params *instanceTypeParameters) bool {
+	if params.FlexEnabled && (getArchitecture(architecture) != karpv1.ArchitectureAmd64 || utils.IsGPUSKU(sku.GetName())) {
+		return false
+	}
 	return isArchitectureSupportedByImageFamily(architecture, params.ImageFamily) &&
 		p.isInstanceTypeSupportedByImageFamily(sku.GetName(), params.ImageFamily) &&
 		p.isInstanceTypeSupportedByEncryptionAtHost(sku, params) &&

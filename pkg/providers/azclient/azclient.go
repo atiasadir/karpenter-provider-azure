@@ -18,6 +18,8 @@ package azclient
 
 import (
 	"context"
+	"fmt"
+	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -27,6 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armrecommender"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computelimit/armcomputelimit"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resourcegraph/armresourcegraph"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
@@ -36,6 +39,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/aksmachinesheaderbatch"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/capacityrecommendation"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	imagefamilytypes "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/skuclient"
@@ -50,6 +54,7 @@ import (
 )
 
 type AZClient struct {
+	flexProvider                    func() (*flex.Provider, error)
 	azureResourceGraphClient        azapi.AzureResourceGraphAPI
 	virtualMachinesClient           azapi.VirtualMachinesAPI
 	aksMachinesClient               azapi.AKSMachinesAPI
@@ -74,6 +79,26 @@ type AZClient struct {
 	UsageClient                        quota.UsageAPI
 	QuotaCategoryVMFamilyMappingClient quota.QuotaCategoryVMFamilyMappingAPI
 	SKUMixPlacementClient              capacityrecommendation.SKUMixPlacementScoresAPI
+}
+
+// Flex constructs its clients only when an opted-in class or an existing Flex
+// worker needs them. Cleanup remains available after enable-flex-nodes is disabled.
+func (c *AZClient) Flex() (*flex.Provider, error) {
+	if c.flexProvider == nil {
+		return nil, fmt.Errorf("flex clients are not configured")
+	}
+	provider, err := c.flexProvider()
+	if err != nil {
+		return nil, err
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("flex provider is not configured")
+	}
+	return provider, nil
+}
+
+func (c *AZClient) SetFlexProvider(provider *flex.Provider) {
+	c.flexProvider = func() (*flex.Provider, error) { return provider, nil }
 }
 
 func (c *AZClient) SubnetsClient() azapi.SubnetsAPI {
@@ -351,7 +376,7 @@ func NewAZClient(ctx context.Context, cfg *auth.Config, env *auth.Environment, c
 		)
 	}
 
-	return NewAZClientFromAPI(
+	result := NewAZClientFromAPI(
 		virtualMachinesClient,
 		azureResourceGraphClient,
 		aksMachinesClient,
@@ -374,5 +399,30 @@ func NewAZClient(ctx context.Context, cfg *auth.Config, env *auth.Environment, c
 		usageClient,
 		quotaCategoryVMFamilyMappingAPI,
 		skuMixPlacementClient,
-	), nil
+	)
+	result.flexProvider = sync.OnceValues(func() (*flex.Provider, error) {
+		networks, err := armnetwork.NewVirtualNetworksClient(cfg.SubscriptionID, cred, opts)
+		if err != nil {
+			return nil, err
+		}
+		images, err := armcompute.NewVirtualMachineImagesClient(cfg.SubscriptionID, cred, opts)
+		if err != nil {
+			return nil, err
+		}
+		identities, err := armmsi.NewUserAssignedIdentitiesClient(cfg.SubscriptionID, cred, opts)
+		if err != nil {
+			return nil, err
+		}
+		machines, err := newAKSMachinesClient(cfg.SubscriptionID, cred, opts)
+		if err != nil {
+			return nil, err
+		}
+		pools, err := armcontainerservice.NewAgentPoolsClient(cfg.SubscriptionID, cred, opts)
+		if err != nil {
+			return nil, err
+		}
+		return flex.NewProvider(cfg.SubscriptionID, cfg.ResourceGroup, o.ClusterName, cfg.Location,
+			networks, images, identities, machines, pools), nil
+	})
+	return result, nil
 }

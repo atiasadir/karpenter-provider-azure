@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/logging"
 	"github.com/Azure/karpenter-provider-azure/pkg/metrics"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/bootstrap"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/customscriptsbootstrap"
 	types "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
@@ -155,8 +156,7 @@ func (r *defaultResolver) Resolve(
 	)
 
 	// TODO: as ProvisionModeBootstrappingClient path develops, we will eventually be able to drop the retrieval of imageDistro here.
-	useSIG := options.FromContext(ctx).UseSIG
-	imageDistro, err := mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, useSIG, nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
+	imageDistro, err := resolveImageDistro(ctx, nodeClass, imageFamily, imageID)
 	if err != nil {
 		return nil, err
 	}
@@ -218,6 +218,23 @@ func (r *defaultResolver) Resolve(
 		EnableFIPS1403Encryption:  requiresFIPS1403Encryption(imageDistro),
 		IsWindows:                 false, // TODO(Windows)
 	}
+	if nodeClass.Spec.Flex != nil {
+		nodeName := utils.GenerateVMName(nodeClaim.Name)
+		providerID := utils.VMResourceIDToProviderID(ctx, fmt.Sprintf(
+			"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s",
+			staticParameters.SubscriptionID, staticParameters.ResourceGroup, nodeName,
+		))
+		template.ScriptlessCustomData = bootstrap.Flex{
+			AgentPoolID:             nodeClass.Spec.Flex.AgentPoolID,
+			ManagedIdentityClientID: nodeClass.Spec.Flex.IdentityClientID,
+			NodeName:                nodeName,
+			ProviderID:              providerID,
+			Architecture:            staticParameters.Arch,
+			Labels:                  staticParameters.Labels,
+			Taints:                  allTaints,
+			KubeletConfig:           prepareKubeletConfiguration(ctx, instanceType, nodeClass),
+		}
+	}
 
 	return template, nil
 }
@@ -237,6 +254,13 @@ func requiresFIPS1403Encryption(distro string) bool {
 	default:
 		return false
 	}
+}
+
+func resolveImageDistro(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, imageFamily ImageFamily, imageID string) (string, error) {
+	if nodeClass.Spec.Flex != nil {
+		return "", flex.ValidateConfiguration(ctx, nodeClass)
+	}
+	return mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, options.FromContext(ctx).UseSIG, nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
 }
 
 func mapToImageDistro(imageID string, fipsMode *v1beta1.FIPSMode, imageFamily ImageFamily, useSIG bool, trustedLaunch bool, kataEnabled bool) (string, error) {

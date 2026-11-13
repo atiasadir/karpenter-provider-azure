@@ -18,6 +18,7 @@ package garbagecollection_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -27,12 +28,15 @@ import (
 	"github.com/awslabs/operatorpkg/object"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/cloudprovider"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
+	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
@@ -40,8 +44,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	clock "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
@@ -136,6 +143,91 @@ var _ = AfterEach(func() {
 	// Wait for any async polling goroutines to complete before resetting
 	cloudProvider.WaitForInstancePromises()
 	ExpectCleanedUp(ctx, env.Client)
+})
+
+var _ = Describe("Flex failed-launch cleanup", func() {
+	var claim *karpv1.NodeClaim
+	var cleanup *garbagecollection.Flex
+	var vmName, machineID string
+
+	BeforeEach(func() {
+		test.WithFlex(azureEnv.SubscriptionID, testOptions.ClusterName)(nodeClass)
+		test.ConfigureFlex(ctx, azureEnv, nodeClass)
+		cleanup = garbagecollection.NewFlex(env.Client, azureEnv.VMInstanceProvider)
+		claim = coretest.NodeClaim(karpv1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Finalizers: []string{karpv1.TerminationFinalizer, flex.TerminationFinalizer}},
+			Spec:       karpv1.NodeClaimSpec{NodeClassRef: nodePool.Spec.Template.Spec.NodeClassRef},
+		})
+		claim.Status = karpv1.NodeClaimStatus{}
+		vmName = instance.GenerateResourceName(claim.Name)
+		claim.Annotations = map[string]string{
+			flex.PoolAnnotation: nodeClass.Spec.Flex.AgentPoolID,
+			flex.ProviderIDAnnotation: fmt.Sprintf("azure:///subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s",
+				azureEnv.SubscriptionID, testOptions.NodeResourceGroup, vmName),
+		}
+		machineID = fake.MkMachineID("test-cluster-resource-group", testOptions.ClusterName, test.FlexPoolName, vmName)
+		azureEnv.AKSDataStorage.AKSMachines.Store(machineID, armcontainerservice.Machine{})
+		ExpectApplied(ctx, env.Client, claim)
+		Expect(env.Client.Delete(ctx, claim)).To(Succeed())
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+	})
+
+	It("should remove a failed enrollment without a NodeClass or status provider ID", func() {
+		Expect(claim.Status.ProviderID).To(BeEmpty())
+		Expect(testOptions.EnableFlexNodes).To(BeFalse())
+		_, err := cleanup.Reconcile(ctx, claim)
+		Expect(err).ToNot(HaveOccurred())
+		_, exists := azureEnv.AKSDataStorage.AKSMachines.Load(machineID)
+		Expect(exists).To(BeFalse())
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		Expect(claim.Finalizers).ToNot(ContainElement(flex.TerminationFinalizer))
+		_, err = cleanup.Reconcile(ctx, claim)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(azureEnv.AKSAgentPoolsAPI.AgentPoolDeleteMachinesBehavior.Calls()).To(Equal(1))
+	})
+
+	It("should retain the finalizer and enrollment until cleanup succeeds", func() {
+		azureEnv.AKSAgentPoolsAPI.AgentPoolDeleteMachinesBehavior.Error.Set(fmt.Errorf("simulated cleanup failure"))
+		_, err := cleanup.Reconcile(ctx, claim)
+		Expect(err).To(MatchError(ContainSubstring("simulated cleanup failure")))
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		Expect(claim.Finalizers).To(ContainElement(flex.TerminationFinalizer))
+		_, exists := azureEnv.AKSDataStorage.AKSMachines.Load(machineID)
+		Expect(exists).To(BeTrue())
+		_, err = cleanup.Reconcile(ctx, claim)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		Expect(claim.Finalizers).ToNot(ContainElement(flex.TerminationFinalizer))
+	})
+
+	It("should wait for core to drain a registered Node", func() {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: vmName},
+			Spec:       corev1.NodeSpec{ProviderID: claim.Annotations[flex.ProviderIDAnnotation]},
+		}
+		ExpectApplied(ctx, env.Client, node)
+		claim.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
+		Expect(env.Client.Status().Update(ctx, claim)).To(Succeed())
+		result, err := cleanup.Reconcile(ctx, claim)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.RequeueAfter).ToNot(BeZero())
+		Expect(azureEnv.AKSAgentPoolsAPI.AgentPoolDeleteMachinesBehavior.Calls()).To(BeZero())
+		Expect(azureEnv.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(BeZero())
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		Expect(claim.Finalizers).To(ContainElement(flex.TerminationFinalizer))
+	})
+
+	It("should refuse to delete a Node with a different provider identity", func() {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: vmName},
+			Spec:       corev1.NodeSpec{ProviderID: claim.Annotations[flex.ProviderIDAnnotation] + "-other"},
+		}
+		ExpectApplied(ctx, env.Client, node)
+		_, err := cleanup.Reconcile(ctx, claim)
+		Expect(err).To(MatchError(ContainSubstring("different provider ID")))
+		Expect(azureEnv.AKSAgentPoolsAPI.AgentPoolDeleteMachinesBehavior.Calls()).To(BeZero())
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
+	})
 })
 
 // TODO: move before/after each into the tests (see AWS)

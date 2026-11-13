@@ -153,9 +153,13 @@ func (p *Provider) getStaticParameters(
 	}
 
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
-	baseLabels, err := karplabels.Get(ctx, nodeClass, arch, instanceType.Requirements)
-	if err != nil {
-		return nil, err
+	baseLabels := map[string]string{}
+	if nodeClass.Spec.Flex == nil {
+		var err error
+		baseLabels, err = karplabels.Get(ctx, nodeClass, arch, instanceType.Requirements)
+		if err != nil {
+			return nil, err
+		}
 	}
 	labels = lo.Assign(baseLabels, labels)
 
@@ -167,13 +171,16 @@ func (p *Provider) getStaticParameters(
 	// ATTENTION!!!: changes here will NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
 	// Refactoring for code unification is not being invested immediately.
 
-	nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting managed network security group: %w", err)
+	var nsgName, routeTableName string
+	if nodeClass.Spec.Flex == nil {
+		nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting managed network security group: %w", err)
+		}
+		nsgName = lo.FromPtr(nsg.Name)
+		clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
+		routeTableName = fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
 	}
-	nsgName := lo.FromPtr(nsg.Name)
-	clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
-	routeTableName := fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
 
 	return &parameters.StaticParameters{
 		ClusterName:                    options.FromContext(ctx).ClusterName,

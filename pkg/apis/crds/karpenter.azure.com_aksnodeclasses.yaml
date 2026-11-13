@@ -1470,6 +1470,46 @@ spec:
                 - FIPS
                 - Disabled
                 type: string
+              flex:
+                description: |-
+                  flex opts into external Flex workers in a precreated same-region subnet.
+                  Requires enable-flex-nodes, aksscriptless mode, and an AKS cluster created
+                  with networkPlugin=none. Managed Azure CNI clusters cannot enroll Flex nodes.
+                  Omit this field to preserve native AKS provisioning.
+                properties:
+                  agentPoolID:
+                    description: agentPoolID identifies an existing FlexNodes pool
+                      in this AKS cluster.
+                    minLength: 1
+                    pattern: (?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ContainerService/managedClusters/[^/]+/agentPools/[a-z][a-z0-9]{0,11}$
+                    type: string
+                  hostImageVersion:
+                    description: |-
+                      hostImageVersion pins the Canonical ubuntu-24_04-lts/server marketplace
+                      image used for the amd64 host. "latest" is deliberately not accepted.
+                      The Flex pool separately owns the worker's Kubernetes component version.
+                    minLength: 1
+                    pattern: ^[0-9]+\.[0-9]+\.[0-9]+$
+                    type: string
+                  identityClientID:
+                    description: identityClientID selects identityID when the host
+                      requests bootstrap data.
+                    format: uuid
+                    minLength: 1
+                    type: string
+                  identityID:
+                    description: |-
+                      identityID is a preauthorized user-assigned identity attached to each host.
+                      It must have the Flex Node Agent Role at agentPoolID.
+                    minLength: 1
+                    pattern: (?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$
+                    type: string
+                required:
+                - agentPoolID
+                - hostImageVersion
+                - identityClientID
+                - identityID
+                type: object
               gpu:
                 description: gpu contains configuration for GPU-enabled nodes.
                 properties:
