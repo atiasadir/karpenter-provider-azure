@@ -1472,7 +1472,7 @@ spec:
                 type: string
               flex:
                 description: |-
-                  flex opts into external Flex workers in a precreated same-region subnet.
+                  flex opts into external Flex workers in a precreated subnet in the selected location.
                   Requires enable-flex-nodes, aksscriptless mode, and an AKS cluster created
                   with networkPlugin=none. Managed Azure CNI clusters cannot enroll Flex nodes.
                   Omit this field to preserve native AKS provisioning.
@@ -1503,6 +1503,12 @@ spec:
                       It must have the Flex Node Agent Role at agentPoolID.
                     minLength: 1
                     pattern: (?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$
+                    type: string
+                  location:
+                    description: |-
+                      location selects a configured Flex region. Omit it to use the controller region.
+                      The subnet and host image must exist in the selected region.
+                    pattern: ^[a-z0-9]+$
                     type: string
                 required:
                 - agentPoolID

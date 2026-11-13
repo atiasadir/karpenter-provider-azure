@@ -43,13 +43,20 @@ type Controller struct {
 	quotaProvider        quota.Provider
 	clock                clock.PassiveClock
 	lastSuccessfulUpdate time.Time
+	name                 string
 }
 
 func NewController(quotaProvider quota.Provider, clk clock.PassiveClock) *Controller {
 	return &Controller{
 		quotaProvider: quotaProvider,
 		clock:         clk,
+		name:          "quota",
 	}
+}
+
+func (c *Controller) WithName(name string) *Controller {
+	c.name = name
+	return c
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
@@ -72,7 +79,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
-		Named("quota").
+		Named(c.name).
 		WatchesRawSource(singleton.Source()).
 		Complete(singleton.AsReconciler(c))
 }

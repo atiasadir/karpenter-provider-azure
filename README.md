@@ -84,15 +84,24 @@ The following AKS features are not supported:
 
 ## Experimental external-VNet workers
 
-This fork contains an **experimental, default-off, same-region** Flex Node path
+This fork contains an **experimental, default-off** Flex Node path
 for AKS clusters created with **`networkPlugin: none`**. The AKS service rejects
 FlexNodes pools on managed Azure CNI Overlay/Cilium clusters; Unbounded's generic
 existing-CNI support does not remove that enrollment requirement. This path
 cannot extend an existing managed-CNI cluster. Do not change such a cluster's
 networking to make this experiment pass.
 
-This is not a supported upstream capability and has not passed a live external
-worker lifecycle. Cross-region provisioning is rejected.
+This is not a supported upstream capability. A bounded same-region external-VNet
+worker passed real enrollment, readiness, bidirectional pod/Service traffic,
+DNS, logs/exec and automatic VM/NIC/Machine/NodeClaim cleanup on a dedicated
+Kubernetes 1.35.9 no-CNI lab. Cross-region acceptance is still pending.
+
+**Policy limitation:** the Unbounded-only lab did not enforce a matching
+deny-all ingress Kubernetes NetworkPolicy. A new connection from an ordinary,
+non-hostNetwork pod still returned HTTP 200 after convergence time; no other
+policy granted that ingress. Functional routing success is not a security or
+managed-Cilium equivalence claim. Do not use this experiment for sensitive
+workloads or weaken existing policies to reproduce it.
 Ordinary NodeClasses retain the native provisioning path and its existing
 same-VNet restriction; changing `vnetSubnetID` alone does not enable another VNet.
 
@@ -104,8 +113,8 @@ and checks bootstrap-script and agent-archive SHA256 digests before execution.
 The host uses a separately pinned Canonical Ubuntu 24.04 Gen2 marketplace image;
 the Flex pool supplies the Kubernetes bootstrap configuration. Machine API
 provisioning modes, bootstrappingclient, FIPS/node hardening, GPU settings, Kata,
-LocalDNS, Linux OS customization, artifact streaming, kubelet overrides and node
-public IPs are not supported on this path.
+LocalDNS, Linux OS customization, artifact streaming, kubelet overrides, capacity
+reservations and node public IPs are not supported on this path.
 
 Before opting in, predeploy and verify:
 
@@ -114,8 +123,13 @@ Before opting in, predeploy and verify:
 2. A user-assigned host identity with **Azure Kubernetes Service Flex Node Agent
    Role** scoped to that pool. The controller needs read access to the selected
    pool, identity, VNet and image catalog; permission to attach the subnet and
-   identity; and Machine-deletion permission at the selected pool scope.
-3. An explicit subnet in the controller's subscription and region, with suitable
+   identity; and Machine-deletion permission at the selected pool scope. The
+   built-in Azure Kubernetes Service Machine Manager Role
+   (`8e253927-1f29-4d89-baa2-c3a549eff423`) grants Machine read/write and
+   `deleteMachines/action`; combine with Reader at the exact pool scope for the
+   pool GET. Neither grants pool write/delete. A custom role can instead omit
+   Machine write if role-definition capacity and administrative permissions allow.
+3. An explicit subnet in the controller's subscription and selected region, with suitable
    egress, API-server access and network security. VNet peering supplies underlay
    connectivity, not Kubernetes pod or Service routing.
 4. An independently installed, version-matched CNI and cross-site network on the
@@ -128,6 +142,12 @@ Before opting in, predeploy and verify:
 
 Build this fork's controller and install its matching generated CRD before setting
 `ENABLE_FLEX_NODES=true`. Released upstream images do not implement this option.
+For additional regions, set `FLEX_LOCATIONS` to an explicit comma-separated list
+of Azure location names, then select one with `spec.flex.location`. Each enabled
+region gets separate SKU/zone, pricing, quota, unavailable-offering and image
+caches plus regional VM/NIC and launch-template providers; the global `LOCATION`
+and native provisioning remain unchanged. Adding a region requires a controller
+restart. Omit `flex.location` for the controller's home region.
 Then explicitly configure the external NodeClass (replace every placeholder):
 
 ```yaml
@@ -140,6 +160,8 @@ spec:
   maxPods: 110
   vnetSubnetID: /subscriptions/<subscription>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<external-vnet>/subnets/<workers>
   flex:
+    # Optional; must also be enabled in FLEX_LOCATIONS.
+    # location: <azure-location>
     agentPoolID: /subscriptions/<subscription>/resourceGroups/<cluster-rg>/providers/Microsoft.ContainerService/managedClusters/<cluster>/agentPools/<flex-pool>
     identityID: /subscriptions/<subscription>/resourceGroups/<identity-rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<host-identity>
     identityClientID: <host-identity-client-id>
@@ -156,7 +178,7 @@ External workers do not use native identity/tag in-place updates. Recreate an
 external worker to apply changed user tags; pool, host-identity and host-image
 changes participate in NodeClass drift instead.
 
-Creation-time pool ownership, provider ID and configuration hash are persisted on
+Creation-time pool ownership, location, provider ID and configuration hash are persisted on
 the NodeClaim before Azure creation. Cleanup retains that identity after the
 NodeClass changes or disappears, and remains enabled when the feature flag is
 disabled. It stops/deletes the owned VM and NIC before removing its ARM Machine;

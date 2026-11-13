@@ -121,6 +121,7 @@ var _ = Describe("Hash", func() {
 			Entry("identity", func(f *v1beta1.FlexNodeConfiguration) { f.IdentityID += "-other" }),
 			Entry("client ID", func(f *v1beta1.FlexNodeConfiguration) { f.IdentityClientID = "11111111-2222-4333-8444-555555555555" }),
 			Entry("host image", func(f *v1beta1.FlexNodeConfiguration) { f.HostImageVersion = "24.04.202611020" }),
+			Entry("location", func(f *v1beta1.FlexNodeConfiguration) { f.Location = lo.ToPtr("centralus") }),
 		)
 	})
 

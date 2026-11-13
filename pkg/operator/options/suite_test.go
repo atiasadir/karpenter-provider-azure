@@ -74,6 +74,8 @@ var _ = Describe("Options", func() {
 		"ADDITIONAL_TAGS",
 		"ENABLE_AZURE_SDK_LOGGING",
 		"ENABLE_FIPS",
+		"ENABLE_FLEX_NODES",
+		"FLEX_LOCATIONS",
 		"AKS_MACHINES_POOL_NAME",
 		"MANAGE_EXISTING_AKS_MACHINES",
 		"PROVIDER_BATCH_IDLE_DURATION",
@@ -87,6 +89,23 @@ var _ = Describe("Options", func() {
 
 	var fs *coreoptions.FlagSet
 	var opts *options.Options
+
+	DescribeTable("validates explicit Flex locations", func(locations string, valid bool) {
+		candidate := test.Options()
+		candidate.FlexLocations = locations
+		if valid {
+			Expect(candidate.Validate()).To(Succeed())
+		} else {
+			Expect(candidate.Validate()).To(MatchError(ContainSubstring("flex-locations")))
+		}
+	},
+		Entry("home only", "", true),
+		Entry("one remote", "centralus", true),
+		Entry("explicit regions", "centralus,westus2", true),
+		Entry("empty entry", "centralus,", false),
+		Entry("display name", "Central US", false),
+		Entry("whitespace", " centralus", false),
+	)
 
 	BeforeEach(func() {
 		envState = map[string]string{}

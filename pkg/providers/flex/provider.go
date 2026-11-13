@@ -50,6 +50,7 @@ const (
 	SpecHashTag          = "karpenter.azure.com_flex_nodeclass_hash"
 	SpecHashAnnotation   = "karpenter.azure.com/flex-nodeclass-hash"
 	ProviderIDAnnotation = "karpenter.azure.com/flex-provider-id"
+	LocationAnnotation   = "karpenter.azure.com/flex-location"
 	TerminationFinalizer = "karpenter.azure.com/flex-termination"
 )
 
@@ -118,6 +119,9 @@ func ValidateConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass)
 	if opts.NetworkPlugin != consts.NetworkPluginNone {
 		return invalid("FlexRequiresNoCNICluster", "Flex node pools require the AKS cluster networkPlugin=none; managed Azure CNI Overlay/Cilium clusters are not supported")
 	}
+	if location := lo.FromPtr(nodeClass.Spec.Flex.Location); location != "" && !lo.Contains(strings.Split(opts.FlexLocations, ","), location) {
+		return invalid("FlexLocationNotEnabled", "Flex location must be explicitly enabled by the controller's flex-locations setting")
+	}
 	if err := validateHostConfiguration(ctx, nodeClass); err != nil {
 		return err
 	}
@@ -148,8 +152,8 @@ func validateHostConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeCl
 func validateWorkerConfiguration(nodeClass *v1beta1.AKSNodeClass) error {
 	if nodeClass.Spec.LinuxOSConfig != nil || nodeClass.Spec.LocalDNS != nil ||
 		nodeClass.IsKataEnabled() || nodeClass.IsArtifactStreamingExplicitlyEnabled() ||
-		nodeClass.Spec.GPU != nil || nodeClass.IsNodePublicIPEnabled() {
-		return invalid("FlexUnsupportedConfiguration", "Flex workers do not support linuxOSConfig, localDNS, Kata, artifact streaming, GPU configuration, or node public IPs")
+		nodeClass.Spec.GPU != nil || nodeClass.IsNodePublicIPEnabled() || nodeClass.Spec.CapacityReservation != nil {
+		return invalid("FlexUnsupportedConfiguration", "Flex workers do not support linuxOSConfig, localDNS, Kata, artifact streaming, GPU configuration, node public IPs, or capacity reservations")
 	}
 	if nodeClass.Spec.Kubelet != nil && !equality.Semantic.DeepEqual(nodeClass.Spec.Kubelet, &v1beta1.KubeletConfiguration{}) {
 		return invalid("FlexUnsupportedKubeletConfiguration", "Flex workers do not support kubelet overrides; configure pod density with spec.maxPods")
@@ -196,7 +200,7 @@ func (p *Provider) Resolve(ctx context.Context, nodeClass *v1beta1.AKSNodeClass)
 	if err := p.validateIdentity(ctx, nodeClass.Spec.Flex); err != nil {
 		return v1beta1.NodeImage{}, err
 	}
-	return p.resolveHostImage(ctx, nodeClass.Spec.Flex.HostImageVersion)
+	return p.resolveHostImage(ctx, nodeClass.Spec.Flex.GetLocation(p.location), nodeClass.Spec.Flex.HostImageVersion)
 }
 
 func (p *Provider) validateSubnet(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
@@ -208,8 +212,8 @@ func (p *Provider) validateSubnet(ctx context.Context, nodeClass *v1beta1.AKSNod
 	if err != nil {
 		return fmt.Errorf("reading Flex virtual network: %w", err)
 	}
-	if !strings.EqualFold(lo.FromPtr(network.Location), p.location) {
-		return invalid("FlexRegionMismatch", "Flex subnet must be in the controller's region; cross-region workers are not supported")
+	if !strings.EqualFold(lo.FromPtr(network.Location), nodeClass.Spec.Flex.GetLocation(p.location)) {
+		return invalid("FlexRegionMismatch", "Flex subnet must be in the selected location")
 	}
 	return nil
 }
@@ -265,8 +269,8 @@ func (p *Provider) validateIdentity(ctx context.Context, config *v1beta1.FlexNod
 	return nil
 }
 
-func (p *Provider) resolveHostImage(ctx context.Context, imageVersion string) (v1beta1.NodeImage, error) {
-	image, err := p.images.Get(ctx, p.location, HostImagePublisher, HostImageOffer, HostImageSKU, imageVersion, nil)
+func (p *Provider) resolveHostImage(ctx context.Context, location, imageVersion string) (v1beta1.NodeImage, error) {
+	image, err := p.images.Get(ctx, location, HostImagePublisher, HostImageOffer, HostImageSKU, imageVersion, nil)
 	if err != nil {
 		return v1beta1.NodeImage{}, fmt.Errorf("reading pinned Flex host image: %w", err)
 	}

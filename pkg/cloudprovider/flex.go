@@ -26,11 +26,108 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
+	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
+	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
+
+type RegionalProviders struct {
+	InstanceTypes instancetype.Provider
+	Instances     instance.VMProvider
+}
+
+// Each configured region has its own SKU, pricing, quota and instance state.
+// The home provider continues to own all native and AKS Machine API nodes.
+func (c *CloudProvider) WithFlexLocations(home string, locations map[string]RegionalProviders) *CloudProvider {
+	c.location = home
+	c.flexLocations = map[string]*CloudProvider{home: c}
+	for location, providers := range locations {
+		if location == home {
+			continue
+		}
+		regional := New(providers.InstanceTypes, providers.Instances, c.aksMachineInstanceProvider,
+			c.recorder, c.kubeClient, c.imageProvider, c.instanceTypeStore, c.legacyRepairPolicies)
+		regional.location = location
+		regional.flexLocations = c.flexLocations
+		c.flexLocations[location] = regional
+	}
+	return c
+}
+
+func (c *CloudProvider) instanceTypesForVM(ctx context.Context, nodePool *karpv1.NodePool, vm *armcompute.VirtualMachine) ([]*corecloudprovider.InstanceType, error) {
+	provider, err := c.forVM(vm)
+	if err != nil {
+		return nil, err
+	}
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		return nil, err
+	}
+	return provider.instanceTypeProvider.List(ctx, nodeClass)
+}
+
+func (c *CloudProvider) forVM(vm *armcompute.VirtualMachine) (*CloudProvider, error) {
+	if lo.FromPtr(vm.Tags[flex.PoolTag]) == "" || len(c.flexLocations) == 0 {
+		return c, nil
+	}
+	provider := c.flexLocations[strings.ToLower(lo.FromPtr(vm.Location))]
+	if provider == nil {
+		return nil, fmt.Errorf("flex VM location %q has no configured regional scheduling provider", lo.FromPtr(vm.Location))
+	}
+	return provider, nil
+}
+
+func (c *CloudProvider) forNodeClass(nodeClass *v1beta1.AKSNodeClass) (*CloudProvider, error) {
+	location := nodeClass.Spec.Flex.GetLocation(c.location)
+	if location == c.location {
+		return c, nil
+	}
+	if regional, ok := c.flexLocations[location]; ok {
+		return regional, nil
+	}
+	return nil, fmt.Errorf("flex location %q has no configured regional provider", location)
+}
+
+func (c *CloudProvider) deleteFlex(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	providerID := lo.CoalesceOrEmpty(nodeClaim.Status.ProviderID, nodeClaim.Annotations[flex.ProviderIDAnnotation])
+	name, err := nodeclaimutils.GetVMName(providerID)
+	if err != nil {
+		return err
+	}
+	location, err := c.flexDeletionLocation(ctx, nodeClaim, name)
+	if err != nil {
+		return err
+	}
+	provider := c
+	if regional := c.flexLocations[location]; regional != nil {
+		provider = regional
+	} else if location != c.location && len(c.flexLocations) != 0 {
+		log.FromContext(ctx).Info("cleaning up Flex VM without a configured scheduling provider; regional quota adjustment is skipped", "location", location)
+	}
+	return provider.vmInstanceProvider.Delete(ctx, nodeClaim, name)
+}
+
+func (c *CloudProvider) flexDeletionLocation(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string) (string, error) {
+	recorded := nodeClaim.Annotations[flex.LocationAnnotation]
+	vm, err := c.vmInstanceProvider.Get(ctx, name)
+	if corecloudprovider.IsNodeClaimNotFoundError(err) {
+		return recorded, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	actual := strings.ToLower(lo.FromPtr(vm.Location))
+	if recorded != "" && actual != recorded {
+		return "", fmt.Errorf("flex VM location differs from its creation-time ownership")
+	}
+	return actual, nil
+}
 
 // Persist intent before creating anything in Azure. The additional finalizer
 // covers failed launches, for which core can have no status.providerID to delete.

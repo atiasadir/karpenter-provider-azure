@@ -87,7 +87,7 @@ func NewControllers(
 
 		nodeclaimgarbagecollection.NewInstance(kubeClient, cloudProvider, clk),
 		nodeclaimgarbagecollection.NewNetworkInterface(kubeClient, vmInstanceProvider),
-		nodeclaimgarbagecollection.NewFlex(kubeClient, vmInstanceProvider),
+		nodeclaimgarbagecollection.NewFlex(kubeClient, cloudProvider),
 
 		// TODO: nodeclaim tagging
 		inplaceupdate.NewController(kubeClient, vmInstanceProvider, aksMachineInstanceProvider),

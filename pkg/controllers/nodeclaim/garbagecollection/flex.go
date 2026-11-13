@@ -44,10 +44,14 @@ import (
 // Flex owns cleanup intent even when launch failed before core recorded a provider ID.
 type Flex struct {
 	kubeClient client.Client
-	instances  instance.VMProvider
+	instances  interface {
+		Delete(context.Context, *karpv1.NodeClaim) error
+	}
 }
 
-func NewFlex(kubeClient client.Client, instances instance.VMProvider) *Flex {
+func NewFlex(kubeClient client.Client, instances interface {
+	Delete(context.Context, *karpv1.NodeClaim) error
+}) *Flex {
 	return &Flex{kubeClient: kubeClient, instances: instances}
 }
 
@@ -68,7 +72,7 @@ func (c *Flex) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim) (reco
 	if node != nil && nodeClaim.StatusConditions().Get(karpv1.ConditionTypeRegistered).IsTrue() {
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	deleteErr := c.instances.Delete(ctx, nodeClaim, vmName)
+	deleteErr := c.instances.Delete(ctx, nodeClaim)
 	if cloudprovider.IgnoreNodeClaimNotFoundError(deleteErr) != nil {
 		return reconcile.Result{}, deleteErr
 	}

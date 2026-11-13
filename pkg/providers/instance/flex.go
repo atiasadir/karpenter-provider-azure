@@ -33,6 +33,9 @@ func (p *DefaultVMProvider) PrepareFlex(ctx context.Context, nodeClass *v1beta1.
 	if nodeClass.Spec.Flex == nil {
 		return nil, nil
 	}
+	if nodeClass.Spec.Flex.GetLocation(p.location) != p.location {
+		return nil, fmt.Errorf("flex location does not match the selected VM provider")
+	}
 	provider, err := p.azClient.Flex()
 	if err != nil {
 		return nil, err
@@ -48,6 +51,7 @@ func (p *DefaultVMProvider) PrepareFlex(ctx context.Context, nodeClass *v1beta1.
 		flex.PoolAnnotation:       nodeClass.Spec.Flex.AgentPoolID,
 		flex.SpecHashAnnotation:   nodeClass.Hash(),
 		flex.ProviderIDAnnotation: p.flexProviderID(ctx, GenerateResourceName(nodeClaim.Name)),
+		flex.LocationAnnotation:   p.location,
 	}, nil
 }
 
@@ -71,6 +75,7 @@ func (p *DefaultVMProvider) FlexMetadata(ctx context.Context, vm *armcompute.Vir
 		flex.PoolAnnotation:       id,
 		flex.SpecHashAnnotation:   lo.FromPtr(vm.Tags[flex.SpecHashTag]),
 		flex.ProviderIDAnnotation: p.flexProviderID(ctx, *vm.Name),
+		flex.LocationAnnotation:   strings.ToLower(lo.FromPtr(vm.Location)),
 	}, nil
 }
 

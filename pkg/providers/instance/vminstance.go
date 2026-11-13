@@ -407,7 +407,9 @@ func (p *DefaultVMProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeCl
 		if err := p.cleanupFlexResources(ctx, poolID, resourceName); err != nil {
 			return err
 		}
-		p.quotaLifecycle.recordDeleteFromNodeClaim(ctx, nodeClaim)
+		if nodeClaim.Annotations[flex.LocationAnnotation] == p.location {
+			p.quotaLifecycle.recordDeleteFromNodeClaim(ctx, nodeClaim)
+		}
 		return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("flex worker resources have been deleted"))
 	}
 	gone, err := p.deleteImpl(ctx, resourceName)

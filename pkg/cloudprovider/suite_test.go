@@ -66,6 +66,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/flex"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	corestatus "github.com/awslabs/operatorpkg/status"
 )
@@ -619,6 +620,240 @@ var _ = Describe("CloudProvider", func() {
 				Expect(exists).To(BeFalse())
 				_, exists = azureEnv.AKSDataStorage.AKSMachines.Load(owned)
 				Expect(exists).To(BeFalse())
+			})
+
+			Context("regional routing", func() {
+				var remote *test.Environment
+
+				storeRemoteVM := func() *armcompute.VirtualMachine {
+					vm, err := remote.VMInstanceProvider.Get(ctx, instance.GenerateResourceName(nodeClaim.Name))
+					Expect(err).ToNot(HaveOccurred())
+					// ARM and Resource Graph expose the same shared resource group to both providers.
+					azureEnv.VirtualMachinesAPI.Instances.Store(*vm.ID, *vm)
+					return vm
+				}
+
+				BeforeEach(func() {
+					testOptions.FlexLocations = fake.RegionNonZonal
+					nodeClass.Spec.Flex.Location = lo.ToPtr(fake.RegionNonZonal)
+					remote = test.NewEnvironmentNonZonal(ctx, env)
+					test.ConfigureFlex(ctx, remote, nodeClass)
+					cloudProvider.WithFlexLocations(fake.Region, map[string]RegionalProviders{
+						fake.RegionNonZonal: {InstanceTypes: remote.InstanceTypesProvider, Instances: remote.VMInstanceProvider},
+					})
+					ExpectApplied(ctx, env.Client, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+					for _, condition := range nodeClass.GetConditions() {
+						nodeClass.StatusConditions().SetTrue(condition.Type)
+					}
+					Expect(env.Client.Status().Update(ctx, nodeClass)).To(Succeed())
+				})
+
+				AfterEach(func() {
+					cloudProvider.WaitForInstancePromises()
+					remote.Reset(ctx)
+				})
+
+				It("should select regional offerings and create a VM and NIC in that region", func() {
+					types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(types).ToNot(BeEmpty())
+					for _, instanceType := range types {
+						Expect(instanceType.Requirements.Get(v1.LabelTopologyRegion).Any()).To(Equal(fake.RegionNonZonal))
+						for _, offering := range instanceType.Offerings {
+							Expect(offering.Requirements.Get(v1.LabelTopologyZone).Any()).To(Equal(zones.Regional))
+						}
+					}
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(created.Labels[v1.LabelTopologyRegion]).To(Equal(fake.RegionNonZonal))
+					Expect(created.Annotations[flex.LocationAnnotation]).To(Equal(fake.RegionNonZonal))
+					vm, err := remote.VMInstanceProvider.Get(ctx, instance.GenerateResourceName(nodeClaim.Name))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(vm.Location).To(Equal(lo.ToPtr(fake.RegionNonZonal)))
+					nic, err := remote.VMInstanceProvider.GetNic(ctx, testOptions.NodeResourceGroup, *vm.Name)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(nic.Location).To(Equal(lo.ToPtr(fake.RegionNonZonal)))
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+					Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.Calls()).To(BeZero())
+				})
+
+				It("should clean up in the creation region even after the class returns to the home region", func() {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					vmName := instance.GenerateResourceName(nodeClaim.Name)
+					owned := fake.MkMachineID("test-cluster-resource-group", testOptions.ClusterName, test.FlexPoolName, vmName)
+					remote.AKSDataStorage.AKSMachines.Store(owned, armcontainerservice.Machine{})
+					vm, err := remote.VMInstanceProvider.Get(ctx, vmName)
+					Expect(err).ToNot(HaveOccurred())
+					storeRemoteVM()
+					nodeClass.Spec.Flex.Location = nil
+					ExpectApplied(ctx, env.Client, nodeClass)
+					types, err := cloudProvider.instanceTypesForVM(ctx, nodePool, vm)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(types).ToNot(BeEmpty())
+					Expect(types[0].Requirements.Get(v1.LabelTopologyRegion).Any()).To(Equal(fake.RegionNonZonal))
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, created))).To(BeTrue())
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, created))).To(BeTrue())
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(BeZero())
+					Expect(remote.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(Equal(1))
+					_, exists := remote.AKSDataStorage.AKSMachines.Load(owned)
+					Expect(exists).To(BeFalse())
+				})
+
+				DescribeTable("should recover actual VM location despite mutable Kubernetes metadata", func(change string, recordedLocation string) {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					storeRemoteVM()
+					Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+					nodeClaim.Annotations[flex.LocationAnnotation] = recordedLocation
+					ExpectApplied(ctx, env.Client, nodeClaim)
+					switch change {
+					case "home":
+						nodeClass.Spec.Flex.Location = nil
+						ExpectApplied(ctx, env.Client, nodeClass)
+					case "native":
+						nodeClass.Spec.Flex = nil
+						ExpectApplied(ctx, env.Client, nodeClass)
+					case "missing":
+						Expect(env.Client.Delete(ctx, nodeClass)).To(Succeed())
+					case "missing-pool":
+						Expect(env.Client.Delete(ctx, nodePool)).To(Succeed())
+					}
+					recovered, err := cloudProvider.Get(ctx, created.Status.ProviderID)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(recovered.Status.ProviderID).To(Equal(created.Status.ProviderID))
+					Expect(recovered.Labels[v1.LabelTopologyRegion]).To(Equal(fake.RegionNonZonal))
+					Expect(recovered.Annotations[flex.LocationAnnotation]).To(Equal(fake.RegionNonZonal))
+					listed, err := cloudProvider.List(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(listed).To(HaveLen(1))
+					Expect(listed[0].Labels[v1.LabelTopologyRegion]).To(Equal(fake.RegionNonZonal))
+					Expect(listed[0].Annotations[flex.LocationAnnotation]).To(Equal(fake.RegionNonZonal))
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, recovered))).To(BeTrue())
+					Expect(remote.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(Equal(1))
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(BeZero())
+				},
+					Entry("edited region and absent annotation", "home", ""),
+					Entry("removed Flex configuration and stale annotation", "native", fake.Region),
+					Entry("missing NodeClass and absent annotation", "missing", ""),
+					Entry("missing NodePool and stale annotation", "missing-pool", fake.Region),
+				)
+
+				It("should list the shared resource group once without duplicating or relabeling remote VMs", func() {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					remoteVM := storeRemoteVM()
+					homeVM := *remoteVM
+					homeVM.Name = lo.ToPtr("aks-home")
+					homeVM.ID = lo.ToPtr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s",
+						azureEnv.SubscriptionID, testOptions.NodeResourceGroup, *homeVM.Name))
+					homeVM.Location = lo.ToPtr(fake.Region)
+					azureEnv.VirtualMachinesAPI.Instances.Store(*homeVM.ID, homeVM)
+					listed, err := cloudProvider.List(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(listed).To(HaveLen(2))
+					byID := lo.KeyBy(listed, func(n *karpv1.NodeClaim) string { return n.Status.ProviderID })
+					Expect(byID).To(HaveLen(2))
+					Expect(byID).To(HaveKey(created.Status.ProviderID))
+					Expect(byID).To(HaveKey(utils.VMResourceIDToProviderID(ctx, *homeVM.ID)))
+					Expect(byID[created.Status.ProviderID].Labels[v1.LabelTopologyRegion]).To(Equal(fake.RegionNonZonal))
+					Expect(byID[utils.VMResourceIDToProviderID(ctx, *homeVM.ID)].Labels[v1.LabelTopologyRegion]).To(Equal(fake.Region))
+					Expect(azureEnv.AzureResourceGraphAPI.AzureResourceGraphResourcesBehavior.Calls()).To(Equal(1))
+					Expect(remote.AzureResourceGraphAPI.AzureResourceGraphResourcesBehavior.Calls()).To(BeZero())
+				})
+
+				DescribeTable("should reject unknown VM locations even without a NodeClass", func(location string) {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					vm := storeRemoteVM()
+					vm.Location = lo.ToPtr(location)
+					azureEnv.VirtualMachinesAPI.Instances.Store(*vm.ID, *vm)
+					Expect(env.Client.Delete(ctx, nodeClass)).To(Succeed())
+					_, err = cloudProvider.Get(ctx, created.Status.ProviderID)
+					Expect(err).To(MatchError(ContainSubstring("no configured regional scheduling provider")))
+					_, err = cloudProvider.List(ctx)
+					Expect(err).To(MatchError(ContainSubstring("no configured regional scheduling provider")))
+				},
+					Entry("missing location", ""),
+					Entry("unconfigured location", "unconfigured"),
+				)
+
+				It("should route deletion with no region annotation using the live VM and reject a conflicting annotation", func() {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					storeRemoteVM()
+					created.Annotations[flex.LocationAnnotation] = fake.Region
+					Expect(cloudProvider.Delete(ctx, created)).To(MatchError(ContainSubstring("location differs")))
+					Expect(remote.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(BeZero())
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(BeZero())
+					delete(created.Annotations, flex.LocationAnnotation)
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, created))).To(BeTrue())
+					Expect(remote.VirtualMachinesAPI.VirtualMachineDeleteBehavior.Calls()).To(Equal(1))
+				})
+
+				It("should clean up a disabled region without releasing home-region quota", func() {
+					created, err := CreateAndWaitForPromises(ctx, cloudProvider, remote, nodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					vm := storeRemoteVM()
+					sku := fake.MakeSKU(string(lo.FromPtr(vm.Properties.HardwareProfile.VMSize)))
+					azureEnv.UsageAPI.Usages.Append(&armcompute.Usage{
+						Name:         &armcompute.UsageName{Value: lo.ToPtr(sku.GetFamilyName())},
+						CurrentValue: lo.ToPtr[int32](100), Limit: lo.ToPtr[int64](100),
+					})
+					Expect(azureEnv.QuotaProvider.Update(ctx)).To(Succeed())
+					Expect(azureEnv.QuotaProvider.HasQuotaFor(ctx, sku)).To(BeFalse())
+					cloudProvider.WithFlexLocations(fake.Region, nil)
+					_, err = cloudProvider.Get(ctx, created.Status.ProviderID)
+					Expect(err).To(MatchError(ContainSubstring("no configured regional scheduling provider")))
+					Expect(corecloudprovider.IsNodeClaimNotFoundError(cloudProvider.Delete(ctx, created))).To(BeTrue())
+					Expect(azureEnv.QuotaProvider.HasQuotaFor(ctx, sku)).To(BeFalse())
+					_, exists := azureEnv.VirtualMachinesAPI.Instances.Load(*vm.ID)
+					Expect(exists).To(BeFalse())
+				})
+
+				It("should isolate regional quota filtering from the home offering cache", func() {
+					sku := fake.MakeSKU("Standard_D2s_v3")
+					homeTypes, err := azureEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(lo.SomeBy(homeTypes, func(it *corecloudprovider.InstanceType) bool {
+						return lo.SomeBy(it.Offerings, func(o *corecloudprovider.Offering) bool { return o.Available })
+					})).To(BeTrue())
+					remote.UsageAPI.Usages.Append(&armcompute.Usage{
+						Name:         &armcompute.UsageName{Value: lo.ToPtr(sku.GetFamilyName())},
+						CurrentValue: lo.ToPtr[int32](100), Limit: lo.ToPtr[int64](100),
+					})
+					Expect(remote.QuotaProvider.Update(ctx)).To(Succeed())
+					types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(types).ToNot(BeEmpty())
+					for _, it := range types {
+						if it.Name != sku.GetName() {
+							continue
+						}
+						for _, offering := range it.Offerings {
+							if offering.Requirements.Get(karpv1.CapacityTypeLabelKey).Has(karpv1.CapacityTypeOnDemand) {
+								Expect(offering.Available).To(BeFalse())
+							}
+						}
+					}
+					homeAfter, err := azureEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(homeAfter).To(Equal(homeTypes))
+					Expect(azureEnv.QuotaProvider.HasQuotaFor(ctx, sku)).To(BeTrue())
+					Expect(remote.QuotaProvider.HasQuotaFor(ctx, sku)).To(BeFalse())
+				})
+
+				It("should preserve home-region scheduling and reject an unconfigured region", func() {
+					home, err := cloudProvider.forNodeClass(test.AKSNodeClass())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(home).To(BeIdenticalTo(cloudProvider))
+					nodeClass.Spec.Flex.Location = lo.ToPtr("unconfigured")
+					_, err = cloudProvider.forNodeClass(nodeClass)
+					Expect(err).To(MatchError(ContainSubstring("no configured regional provider")))
+					Expect(remote.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.Calls()).To(BeZero())
+				})
 			})
 		})
 

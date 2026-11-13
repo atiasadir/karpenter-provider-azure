@@ -89,6 +89,8 @@ type CloudProvider struct {
 	instanceTypeStore          *nodeoverlay.InstanceTypeStore
 	instancePromiseWg          sync.WaitGroup
 	legacyRepairPolicies       bool
+	location                   string
+	flexLocations              map[string]*CloudProvider
 }
 
 func New(
@@ -116,6 +118,11 @@ func New(
 // WaitForInstancePromises blocks until all in-flight async Create goroutines have completed.
 func (c *CloudProvider) WaitForInstancePromises() {
 	c.instancePromiseWg.Wait()
+	for _, provider := range c.flexLocations {
+		if provider != c {
+			provider.instancePromiseWg.Wait()
+		}
+	}
 }
 
 func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
@@ -165,10 +172,13 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err = c.validateNodeClass(ctx, nodeClass); err != nil {
 		return nil, err
 	}
-
+	provider, err := c.forNodeClass(nodeClass)
+	if err != nil {
+		return nil, cloudprovider.NewNodeClassNotReadyError(err)
+	}
 	// Filter static requirement and resource incompatibilities here. Offering availability is
 	// checked by the instance provider after it first gets a chance to reuse an existing resource.
-	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
+	instanceTypes, err := provider.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), InstanceTypeResolutionFailedReason, truncateMessage(err.Error()))
 	}
@@ -181,7 +191,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		return c.createAKSMachineInstance(ctx, nodeClass, nodeClaim, instanceTypes)
 	}
 
-	return c.createVMInstance(ctx, nodeClass, nodeClaim, instanceTypes)
+	return provider.createVMInstance(ctx, nodeClass, nodeClaim, instanceTypes)
 }
 
 func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) (*karpv1.NodeClaim, error) {
@@ -494,7 +504,11 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 		// as the cause.
 		return nil, fmt.Errorf("resolving node class, %w", err)
 	}
-	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	provider, err := c.forNodeClass(nodeClass)
+	if err != nil {
+		return nil, err
+	}
+	instanceTypes, err := provider.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
 	}
@@ -507,6 +521,9 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 // one Delete call is blocking more will come in every ~5s due to excess Node events + requeues.
 func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", nodeClaim.Name))
+	if nodeClaim.Annotations[flex.PoolAnnotation] != "" {
+		return c.deleteFlex(ctx, nodeClaim)
+	}
 
 	// AKS machine-based node
 	if aksMachineName, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
@@ -711,12 +728,15 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 }
 
 func (c *CloudProvider) resolveInstanceTypeFromVMInstance(ctx context.Context, vm *armcompute.VirtualMachine) (*cloudprovider.InstanceType, error) {
+	if _, err := c.forVM(vm); err != nil {
+		return nil, err
+	}
 	nodePool, err := c.resolveNodePoolFromVMInstance(ctx, vm)
 	if err != nil {
 		// If we can't resolve the provisioner, we fallback to not getting instance type info
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving node pool, %w", err))
 	}
-	instanceTypes, err := c.GetInstanceTypes(ctx, nodePool)
+	instanceTypes, err := c.instanceTypesForVM(ctx, nodePool, vm)
 	if err != nil {
 		// If we can't resolve the nodepool, we fallback to not getting instance type info
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving node template, %w", err))
@@ -794,6 +814,7 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 		nodeClaim.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 	}
 	nodeClaim.Status.ProviderID = utils.VMResourceIDToProviderID(ctx, *vm.ID)
+	nodeClaim.Labels[corev1.LabelTopologyRegion] = strings.ToLower(lo.CoalesceOrEmpty(lo.FromPtr(vm.Location), nodeClaim.Labels[corev1.LabelTopologyRegion]))
 	if vm.Properties != nil && vm.Properties.StorageProfile != nil && vm.Properties.StorageProfile.ImageReference != nil {
 		nodeClaim.Status.ImageID = utils.ImageReferenceToString(vm.Properties.StorageProfile.ImageReference)
 	}

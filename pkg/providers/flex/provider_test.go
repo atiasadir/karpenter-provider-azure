@@ -132,6 +132,9 @@ func TestResolveFlexRejectsUnsupportedPrerequisites(t *testing.T) {
 		{"public IP", "FlexUnsupportedConfiguration", func(f *fixture) {
 			f.nodeClass.Spec.NodePublicIP = &v1beta1.NodePublicIP{Enabled: lo.ToPtr(true)}
 		}},
+		{"capacity reservation", "FlexUnsupportedConfiguration", func(f *fixture) {
+			f.nodeClass.Spec.CapacityReservation = &v1beta1.CapacityReservationConfiguration{GroupID: lo.ToPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/capacityReservationGroups/crg")}
+		}},
 		{"missing image properties", "FlexUnsupportedHostImage", func(f *fixture) {
 			f.images.GetFunc = func(context.Context, string, string, string, string, string, *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
 				return armcompute.VirtualMachineImagesClientGetResponse{}, nil
@@ -161,6 +164,30 @@ func TestResolveFlexPreservesAzureErrors(t *testing.T) {
 	}
 	_, err := f.provider.Resolve(f.ctx, f.nodeClass)
 	g.Expect(errors.Is(err, expected)).To(BeTrue())
+}
+
+func TestResolveFlexUsesSelectedRegionForNetworkAndImage(t *testing.T) {
+	g := NewWithT(t)
+	f := newFixture()
+	f.opts.FlexLocations = "centralus"
+	f.nodeClass.Spec.Flex.Location = lo.ToPtr("centralus")
+	f.networks.Location = "centralus"
+	f.images.GetFunc = func(ctx context.Context, location, publisher, offer, sku, version string, opts *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+		g.Expect(location).To(Equal("centralus"))
+		return (&fake.VirtualMachineImagesAPI{}).Get(ctx, location, publisher, offer, sku, version, opts)
+	}
+	_, err := f.provider.Resolve(f.ctx, f.nodeClass)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	f.networks.Location = "eastus2"
+	_, err = f.provider.Resolve(f.ctx, f.nodeClass)
+	var configError *flex.ConfigurationError
+	g.Expect(errors.As(err, &configError)).To(BeTrue())
+	g.Expect(configError.Reason).To(Equal("FlexRegionMismatch"))
+	f.opts.FlexLocations = ""
+	_, err = f.provider.Resolve(f.ctx, f.nodeClass)
+	g.Expect(errors.As(err, &configError)).To(BeTrue())
+	g.Expect(configError.Reason).To(Equal("FlexLocationNotEnabled"))
 }
 
 func TestFlexCleanupIsScopedAndIdempotent(t *testing.T) {

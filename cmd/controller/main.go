@@ -61,7 +61,7 @@ func main() {
 		op.ImageProvider,
 		op.InstanceTypeStore,
 		coreoptions.FromContext(ctx).LegacyNodeRepair,
-	)
+	).WithFlexLocations(op.Location, op.FlexLocations)
 
 	lo.Must0(op.AddHealthzCheck("cloud-provider", aksCloudProvider.LivenessProbe))
 
@@ -112,5 +112,6 @@ func main() {
 			options.FromContext(ctx).NetworkPlugin,
 			op.AZClient.Flex,
 		)...).
+		WithControllers(ctx, op.FlexControllers...).
 		Start(ctx)
 }

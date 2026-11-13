@@ -75,6 +75,11 @@ type CapacityReservationConfiguration struct {
 // FlexNodeConfiguration opts into customer-managed Flex workers. The Flex pool,
 // identity, subnet, and cross-site networking are provisioned outside Karpenter.
 type FlexNodeConfiguration struct {
+	// location selects a configured Flex region. Omit it to use the controller region.
+	// The subnet and host image must exist in the selected region.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]+$`
+	// +optional
+	Location *string `json:"location,omitempty"`
 	// agentPoolID identifies an existing FlexNodes pool in this AKS cluster.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=`(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.ContainerService/managedClusters/[^/]+/agentPools/[a-z][a-z0-9]{0,11}$`
@@ -107,6 +112,13 @@ func (in *FlexNodeConfiguration) normalizeForHash() {
 	in.AgentPoolID = strings.ToLower(in.AgentPoolID)
 	in.IdentityID = strings.ToLower(in.IdentityID)
 	in.IdentityClientID = strings.ToLower(in.IdentityClientID)
+}
+
+func (in *FlexNodeConfiguration) GetLocation(defaultLocation string) string {
+	if in == nil || lo.FromPtr(in.Location) == "" {
+		return defaultLocation
+	}
+	return *in.Location
 }
 
 // NodePublicIP configures an instance-level public IP address for each node
@@ -201,7 +213,7 @@ type AKSNodeClassSpec struct {
 	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
 	// +optional
 	VNETSubnetID *string `json:"vnetSubnetID,omitempty"`
-	// flex opts into external Flex workers in a precreated same-region subnet.
+	// flex opts into external Flex workers in a precreated subnet in the selected location.
 	// Requires enable-flex-nodes, aksscriptless mode, and an AKS cluster created
 	// with networkPlugin=none. Managed Azure CNI clusters cannot enroll Flex nodes.
 	// Omit this field to preserve native AKS provisioning.

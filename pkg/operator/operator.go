@@ -53,6 +53,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	azurecache "github.com/Azure/karpenter-provider-azure/pkg/cache"
+	providercloud "github.com/Azure/karpenter-provider-azure/pkg/cloudprovider"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
@@ -75,6 +76,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	armopts "github.com/Azure/karpenter-provider-azure/pkg/utils/clientopts"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
+	"github.com/awslabs/operatorpkg/controller"
 )
 
 func init() {
@@ -103,6 +105,8 @@ type Operator struct {
 	PricingProvider           *pricing.Provider
 	InstanceTypesProvider     instancetype.Provider
 	VMInstanceProvider        *instance.DefaultVMProvider
+	FlexLocations             map[string]providercloud.RegionalProviders
+	FlexControllers           []controller.Controller
 	AKSMachineProvider        *instance.DefaultAKSMachineProvider
 	LoadBalancerProvider      *loadbalancer.Provider
 	QuotaProvider             *quota.DefaultProvider
@@ -299,7 +303,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		quotaProvider,
 	)
 
-	return ctx, &Operator{
+	result := &Operator{
 		Operator:                     operator,
 		InClusterKubernetesInterface: inClusterClient,
 		ManagedDynamicInterface:      managedDynamicClient,
@@ -319,6 +323,8 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		Location:                     azConfig.Location,
 		Cloud:                        env.Cloud,
 	}
+	lo.Must0(result.configureFlexLocations(ctx, azConfig, env, networkSecurityGroupProvider))
+	return ctx, result
 }
 
 func GetAZConfig() (*auth.Config, error) {

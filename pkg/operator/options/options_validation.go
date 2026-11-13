@@ -43,6 +43,7 @@ func (o *Options) Validate() error {
 		o.validateVMMemoryOverheadPercent(),
 		o.validateVnetSubnetID(),
 		o.validateProvisionMode(),
+		o.validateFlexLocations(),
 		o.validateUseSIG(),
 		o.validateAdminUsername(),
 		o.validateAdditionalTags(),
@@ -51,6 +52,19 @@ func (o *Options) Validate() error {
 		o.validateComputeRecommendationMode(),
 		validate.Struct(o),
 	)
+}
+
+func (o *Options) validateFlexLocations() error {
+	if o.FlexLocations == "" {
+		return nil
+	}
+	validLocation := regexp.MustCompile("^[a-z0-9]+$")
+	for _, location := range strings.Split(o.FlexLocations, ",") {
+		if !validLocation.MatchString(location) {
+			return fmt.Errorf("flex-locations must be a comma-separated list of lowercase Azure location names")
+		}
+	}
+	return nil
 }
 
 func (o *Options) validateClusterDNSIP() error {

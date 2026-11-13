@@ -153,7 +153,7 @@ var _ = Describe("Flex failed-launch cleanup", func() {
 	BeforeEach(func() {
 		test.WithFlex(azureEnv.SubscriptionID, testOptions.ClusterName)(nodeClass)
 		test.ConfigureFlex(ctx, azureEnv, nodeClass)
-		cleanup = garbagecollection.NewFlex(env.Client, azureEnv.VMInstanceProvider)
+		cleanup = garbagecollection.NewFlex(env.Client, cloudProvider)
 		claim = coretest.NodeClaim(karpv1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Finalizers: []string{karpv1.TerminationFinalizer, flex.TerminationFinalizer}},
 			Spec:       karpv1.NodeClaimSpec{NodeClassRef: nodePool.Spec.Template.Spec.NodeClassRef},

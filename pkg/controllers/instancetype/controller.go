@@ -39,12 +39,19 @@ const (
 // types on-demand during List calls.
 type Controller struct {
 	instanceTypeProvider instancetypeprovider.Provider
+	name                 string
 }
 
 func NewController(instanceTypeProvider instancetypeprovider.Provider) *Controller {
 	return &Controller{
 		instanceTypeProvider: instanceTypeProvider,
+		name:                 "instancetype",
 	}
+}
+
+func (c *Controller) WithName(name string) *Controller {
+	c.name = name
+	return c
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
@@ -60,7 +67,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
-		Named("instancetype").
+		Named(c.name).
 		WatchesRawSource(singleton.Source()).
 		Complete(singleton.AsReconciler(c))
 }
