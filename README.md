@@ -91,10 +91,12 @@ existing-CNI support does not remove that enrollment requirement. This path
 cannot extend an existing managed-CNI cluster. Do not change such a cluster's
 networking to make this experiment pass.
 
-This is not a supported upstream capability. A bounded same-region external-VNet
-worker passed real enrollment, readiness, bidirectional pod/Service traffic,
-DNS, logs/exec and automatic VM/NIC/Machine/NodeClaim cleanup on a dedicated
-Kubernetes 1.35.9 no-CNI lab. Cross-region acceptance is still pending.
+This is not a supported upstream capability. Bounded same-region and cross-region
+external-VNet workers passed real enrollment, readiness, bidirectional pod/Service
+traffic, DNS, logs/exec and automatic VM/NIC/Machine/NodeClaim cleanup on a dedicated
+Kubernetes 1.35.9 no-CNI lab. The cross-region case used an East US 2 control plane
+and an actual Central US worker, without changing the controller's home region.
+See the [functional evidence and reproduction contract](docs/experimental-flex-e2e.md).
 
 **Policy limitation:** the Unbounded-only lab did not enforce a matching
 deny-all ingress Kubernetes NetworkPolicy. A new connection from an ordinary,
