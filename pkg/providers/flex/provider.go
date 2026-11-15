@@ -42,16 +42,19 @@ import (
 )
 
 const (
-	HostImagePublisher   = "Canonical"
-	HostImageOffer       = "ubuntu-24_04-lts"
-	HostImageSKU         = "server"
-	PoolTag              = "karpenter.azure.com_flex_pool"
-	PoolAnnotation       = "karpenter.azure.com/flex-pool-id"
-	SpecHashTag          = "karpenter.azure.com_flex_nodeclass_hash"
-	SpecHashAnnotation   = "karpenter.azure.com/flex-nodeclass-hash"
-	ProviderIDAnnotation = "karpenter.azure.com/flex-provider-id"
-	LocationAnnotation   = "karpenter.azure.com/flex-location"
-	TerminationFinalizer = "karpenter.azure.com/flex-termination"
+	HostImagePublisher           = "Canonical"
+	HostImageOffer               = "ubuntu-24_04-lts"
+	HostImageSKU                 = "server"
+	AzureLinuxHostImagePublisher = "MicrosoftCBLMariner"
+	AzureLinuxHostImageOffer     = "azure-linux-3"
+	AzureLinuxHostImageSKU       = "azure-linux-3-gen2"
+	PoolTag                      = "karpenter.azure.com_flex_pool"
+	PoolAnnotation               = "karpenter.azure.com/flex-pool-id"
+	SpecHashTag                  = "karpenter.azure.com_flex_nodeclass_hash"
+	SpecHashAnnotation           = "karpenter.azure.com/flex-nodeclass-hash"
+	ProviderIDAnnotation         = "karpenter.azure.com/flex-provider-id"
+	LocationAnnotation           = "karpenter.azure.com/flex-location"
+	TerminationFinalizer         = "karpenter.azure.com/flex-termination"
 )
 
 var imageVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -130,9 +133,9 @@ func ValidateConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass)
 
 func validateHostConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
 	opts := options.FromContext(ctx)
-	if lo.FromPtr(nodeClass.Spec.ImageFamily) != v1beta1.Ubuntu2404ImageFamily ||
+	if !lo.Contains([]string{v1beta1.Ubuntu2404ImageFamily, v1beta1.AzureLinuxImageFamily}, lo.FromPtr(nodeClass.Spec.ImageFamily)) ||
 		nodeClass.IsFIPSEnabled() || opts.EnableFIPS || opts.ShouldUseNodeHardening() {
-		return invalid("FlexUnsupportedImageConfiguration", "Flex workers require Ubuntu2404 without FIPS or node hardening")
+		return invalid("FlexUnsupportedImageConfiguration", "Flex workers require Ubuntu2404 or AzureLinux 3 without FIPS or node hardening")
 	}
 	if lo.FromPtr(nodeClass.Spec.VNETSubnetID) == "" {
 		return invalid("FlexSubnetRequired", "Flex workers require an explicit precreated vnetSubnetID")
@@ -200,7 +203,7 @@ func (p *Provider) Resolve(ctx context.Context, nodeClass *v1beta1.AKSNodeClass)
 	if err := p.validateIdentity(ctx, nodeClass.Spec.Flex); err != nil {
 		return v1beta1.NodeImage{}, err
 	}
-	return p.resolveHostImage(ctx, nodeClass.Spec.Flex.GetLocation(p.location), nodeClass.Spec.Flex.HostImageVersion)
+	return p.resolveHostImage(ctx, nodeClass.Spec.Flex.GetLocation(p.location), lo.FromPtr(nodeClass.Spec.ImageFamily), nodeClass.Spec.Flex.HostImageVersion)
 }
 
 func (p *Provider) validateSubnet(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
@@ -269,8 +272,18 @@ func (p *Provider) validateIdentity(ctx context.Context, config *v1beta1.FlexNod
 	return nil
 }
 
-func (p *Provider) resolveHostImage(ctx context.Context, location, imageVersion string) (v1beta1.NodeImage, error) {
-	image, err := p.images.Get(ctx, location, HostImagePublisher, HostImageOffer, HostImageSKU, imageVersion, nil)
+// HostImageReference is used after ValidateConfiguration on both readiness and create paths.
+func HostImageReference(imageFamily, imageVersion string) *armcompute.ImageReference {
+	publisher, offer, sku := HostImagePublisher, HostImageOffer, HostImageSKU
+	if imageFamily == v1beta1.AzureLinuxImageFamily {
+		publisher, offer, sku = AzureLinuxHostImagePublisher, AzureLinuxHostImageOffer, AzureLinuxHostImageSKU
+	}
+	return &armcompute.ImageReference{Publisher: lo.ToPtr(publisher), Offer: lo.ToPtr(offer), SKU: lo.ToPtr(sku), Version: lo.ToPtr(imageVersion)}
+}
+
+func (p *Provider) resolveHostImage(ctx context.Context, location, imageFamily, imageVersion string) (v1beta1.NodeImage, error) {
+	reference := HostImageReference(imageFamily, imageVersion)
+	image, err := p.images.Get(ctx, location, *reference.Publisher, *reference.Offer, *reference.SKU, imageVersion, nil)
 	if err != nil {
 		return v1beta1.NodeImage{}, fmt.Errorf("reading pinned Flex host image: %w", err)
 	}
@@ -281,7 +294,7 @@ func (p *Provider) resolveHostImage(ctx context.Context, location, imageVersion 
 		return v1beta1.NodeImage{}, invalid("FlexUnsupportedHostImage", "Flex host image must be an x64 Linux Gen2 image")
 	}
 	return v1beta1.NodeImage{
-		ID: strings.Join([]string{HostImagePublisher, HostImageOffer, HostImageSKU, imageVersion}, ":"),
+		ID: utils.ImageReferenceToString(reference),
 		Requirements: []corev1.NodeSelectorRequirement{
 			{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}},
 			{Key: v1beta1.LabelSKUHyperVGeneration, Operator: corev1.NodeSelectorOpIn, Values: []string{v1beta1.HyperVGenerationV2}},

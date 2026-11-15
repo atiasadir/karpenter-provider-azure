@@ -96,7 +96,9 @@ type FlexNodeConfiguration struct {
 	// +kubebuilder:validation:Format=uuid
 	// +required
 	IdentityClientID string `json:"identityClientID,omitempty"`
-	// hostImageVersion pins the Canonical ubuntu-24_04-lts/server marketplace
+	// hostImageVersion pins the marketplace image selected by imageFamily:
+	// Canonical ubuntu-24_04-lts/server for Ubuntu2404 or MicrosoftCBLMariner
+	// azure-linux-3/azure-linux-3-gen2 for AzureLinux. This is the host
 	// image used for the amd64 host. "latest" is deliberately not accepted.
 	// The Flex pool separately owns the worker's Kubernetes component version.
 	// +kubebuilder:validation:MinLength=1

@@ -109,14 +109,21 @@ same-VNet restriction; changing `vnetSubnetID` alone does not enable another VNe
 
 The implementation targets self-hosted `aksscriptless` with `USE_SIG=false`
 and `NETWORK_PLUGIN=none`,
-CPU/amd64 hosts and `imageFamily: Ubuntu2404`. It pins
+CPU/amd64 hosts and `imageFamily: Ubuntu2404` or `AzureLinux` (Azure Linux 3). It pins
 [AKS Flex Node v0.3.0](https://github.com/Azure/AKSFlexNode/tree/4741b41e4feaaca86d0dd53014fd4a141731ea34)
 and checks bootstrap-script and agent-archive SHA256 digests before execution.
-The host uses a separately pinned Canonical Ubuntu 24.04 Gen2 marketplace image;
+The host uses a separately pinned Ubuntu 24.04 or Azure Linux 3 Gen2 marketplace image;
 the Flex pool supplies the Kubernetes bootstrap configuration. Machine API
 provisioning modes, bootstrappingclient, FIPS/node hardening, GPU settings, Kata,
 LocalDNS, Linux OS customization, artifact streaming, kubelet overrides, capacity
 reservations and node public IPs are not supported on this path.
+
+`AzureLinux` selects `MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2`
+for the actual VM host and an immutable `agent-azlinux3` nspawn rootfs from the
+pinned Unbounded release. The bootstrap checks the host's `/etc/os-release`
+against the selected family; running an Azure Linux application container on an
+Ubuntu node does not satisfy this requirement. Fixed system-node OS selection
+remains an AKS node-pool responsibility.
 
 Before opting in, predeploy and verify:
 
@@ -171,7 +178,9 @@ spec:
 ```
 
 Select an actual regional version of
-`Canonical:ubuntu-24_04-lts:server`; `latest` is rejected. Native
+`Canonical:ubuntu-24_04-lts:server` for Ubuntu2404 or
+`MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2` for AzureLinux;
+`latest` is rejected. Native
 `versions.nodeImageVersion` is not a Flex host-image pin. NodeClass readiness checks
 ARM prerequisites and the configured no-CNI requirement, **not** host enrollment, network connectivity or policy
 compatibility.

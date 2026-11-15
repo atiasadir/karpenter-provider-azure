@@ -28,6 +28,8 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 )
 
 func testFlexBootstrap() Flex {
@@ -36,6 +38,7 @@ func testFlexBootstrap() Flex {
 		NodeName:     "aks-test-worker",
 		ProviderID:   "azure:///subscriptions/test-sub/resourceGroups/node-rg/providers/Microsoft.Compute/virtualMachines/aks-test-worker",
 		Architecture: "amd64",
+		ImageFamily:  v1beta1.Ubuntu2404ImageFamily,
 		Labels:       map[string]string{"karpenter.sh/nodepool": "external"},
 		Taints: []corev1.Taint{
 			{Key: "karpenter.sh/unregistered", Effect: corev1.TaintEffectNoExecute},
@@ -128,6 +131,7 @@ func TestFlexScriptRejectsInvalidInputs(t *testing.T) {
 		{"wrong pool resource type", func(f *Flex) { f.AgentPoolID = strings.TrimPrefix(f.ProviderID, "azure://") }},
 		{"pool control characters", func(f *Flex) { f.AgentPoolID += "\n" }},
 		{"unsupported architecture", func(f *Flex) { f.Architecture = "386" }},
+		{"unsupported image family", func(f *Flex) { f.ImageFamily = "AzureLinuxOSGuard" }},
 		{"invalid node name", func(f *Flex) { f.NodeName = "worker;echo" }},
 		{"different backing VM", func(f *Flex) { f.ProviderID += "-other" }},
 		{"non-Azure identity", func(f *Flex) { f.ProviderID = "external:///worker" }},
@@ -143,6 +147,58 @@ func TestFlexScriptRejectsInvalidInputs(t *testing.T) {
 			script, err := input.Script()
 			g.Expect(err).To(HaveOccurred())
 			g.Expect(script).To(BeEmpty())
+		})
+	}
+}
+
+func TestFlexScriptChecksHostOSAndRootFS(t *testing.T) {
+	for _, tc := range []struct {
+		name, family, osID, version string
+		valid                       bool
+	}{
+		{"Ubuntu host", v1beta1.Ubuntu2404ImageFamily, "ubuntu", "24.04", true},
+		{"Azure Linux host", v1beta1.AzureLinuxImageFamily, "azurelinux", "3.0", true},
+		{"Azure Linux alias", v1beta1.AzureLinuxImageFamily, "azlinux", "3.0.20261105", true},
+		{"wrong host OS", v1beta1.AzureLinuxImageFamily, "ubuntu", "24.04", false},
+		{"old Azure Linux", v1beta1.AzureLinuxImageFamily, "azurelinux", "2.0", false},
+		{"wrong selected family", v1beta1.Ubuntu2404ImageFamily, "azurelinux", "3.0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			input := testFlexBootstrap()
+			input.ImageFamily = tc.family
+			encoded, err := input.Script()
+			g.Expect(err).ToNot(HaveOccurred())
+			data, err := base64.StdEncoding.DecodeString(encoded)
+			g.Expect(err).ToNot(HaveOccurred())
+			var config flexCloudConfig
+			g.Expect(yaml.Unmarshal(data, &config)).To(Succeed())
+			for _, file := range config.WriteFiles {
+				switch file.Path {
+				case flexOverridesPath:
+					var overrides flexOverrides
+					g.Expect(json.Unmarshal([]byte(file.Content), &overrides)).To(Succeed())
+					if tc.family == v1beta1.AzureLinuxImageFamily {
+						g.Expect(overrides.Bootstrap.OCIImage).To(Equal(flexAzureLinuxRootFS))
+						g.Expect(overrides.Bootstrap.OCIImage).To(ContainSubstring("@sha256:"))
+					} else {
+						g.Expect(overrides.Bootstrap.OCIImage).To(BeEmpty())
+					}
+				case flexStartPath:
+					guard := strings.Split(file.Content, `case "$(uname -m)"`)[0]
+					guard = strings.Replace(guard, ". /etc/os-release",
+						fmt.Sprintf("ID=%q\nVERSION_ID=%q", tc.osID, tc.version), 1)
+					command := exec.Command("bash")
+					command.Stdin = strings.NewReader(guard)
+					output, err := command.CombinedOutput()
+					if tc.valid {
+						g.Expect(err).ToNot(HaveOccurred(), string(output))
+					} else {
+						g.Expect(err).To(HaveOccurred())
+						g.Expect(string(output)).To(ContainSubstring("does not match"))
+					}
+				}
+			}
 		})
 	}
 }

@@ -689,12 +689,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	setVMPropertiesOSDiskEncryption(vm.Properties, opts.DiskEncryptionSetID)
 	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
 	if opts.NodeClass.Spec.Flex != nil {
-		vm.Properties.StorageProfile.ImageReference = &armcompute.ImageReference{
-			Publisher: lo.ToPtr(flex.HostImagePublisher),
-			Offer:     lo.ToPtr(flex.HostImageOffer),
-			SKU:       lo.ToPtr(flex.HostImageSKU),
-			Version:   lo.ToPtr(opts.NodeClass.Spec.Flex.HostImageVersion),
-		}
+		vm.Properties.StorageProfile.ImageReference = flex.HostImageReference(lo.FromPtr(opts.NodeClass.Spec.ImageFamily), opts.NodeClass.Spec.Flex.HostImageVersion)
 		vm.Identity = ConvertToVirtualMachineIdentity([]string{opts.NodeClass.Spec.Flex.IdentityID})
 	}
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)

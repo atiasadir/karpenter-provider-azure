@@ -225,6 +225,7 @@ func (r *defaultResolver) Resolve(
 			staticParameters.SubscriptionID, staticParameters.ResourceGroup, nodeName,
 		))
 		template.ScriptlessCustomData = bootstrap.Flex{
+			ImageFamily:             lo.FromPtr(nodeClass.Spec.ImageFamily),
 			AgentPoolID:             nodeClass.Spec.Flex.AgentPoolID,
 			ManagedIdentityClientID: nodeClass.Spec.Flex.IdentityClientID,
 			NodeName:                nodeName,

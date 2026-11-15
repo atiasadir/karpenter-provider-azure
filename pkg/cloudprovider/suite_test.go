@@ -539,6 +539,31 @@ var _ = Describe("CloudProvider", func() {
 				Expect(nodeClaim.Annotations[flex.PoolAnnotation]).To(Equal(nodeClass.Spec.Flex.AgentPoolID))
 			})
 
+			It("should create an Azure Linux host with an Azure Linux worker rootfs", func() {
+				nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+				nodeClass.Spec.Flex.HostImageVersion = "3.20261105.01"
+				provider := test.ConfigureFlex(ctx, azureEnv, nodeClass)
+				image, err := provider.Resolve(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				ExpectApplied(ctx, env.Client, nodeClass)
+				nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+				nodeClass.Status.Images = []v1beta1.NodeImage{image}
+				for _, condition := range nodeClass.GetConditions() {
+					nodeClass.StatusConditions().SetTrue(condition.Type)
+				}
+				Expect(env.Client.Status().Update(ctx, nodeClass)).To(Succeed())
+				created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created.Status.ImageID).To(Equal("MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2:3.20261105.01"))
+				vm, err := azureEnv.VMInstanceProvider.Get(ctx, instance.GenerateResourceName(nodeClaim.Name))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vm.Properties.StorageProfile.ImageReference.Publisher).To(Equal(lo.ToPtr(flex.AzureLinuxHostImagePublisher)))
+				data, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(data)).To(ContainSubstring("agent-azlinux3:v20261031@sha256:"))
+				Expect(string(data)).To(ContainSubstring(created.Status.ProviderID))
+			})
+
 			It("should reject stale readiness when the feature is disabled", func() {
 				testOptions.EnableFlexNodes = false
 				_, err := cloudProvider.Create(ctx, nodeClaim)

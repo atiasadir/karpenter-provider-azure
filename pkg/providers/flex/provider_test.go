@@ -93,6 +93,28 @@ func TestResolveFlexPrerequisites(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 }
 
+func TestResolveFlexAzureLinuxHostImage(t *testing.T) {
+	g := NewWithT(t)
+	f := newFixture()
+	f.nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+	f.nodeClass.Spec.Flex.HostImageVersion = "3.20261105.01"
+	f.opts.FlexLocations = "centralus"
+	f.nodeClass.Spec.Flex.Location = lo.ToPtr("centralus")
+	f.networks.Location = "centralus"
+	f.images.GetFunc = func(ctx context.Context, location, publisher, offer, sku, version string, opts *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+		g.Expect([]string{location, publisher, offer, sku, version}).To(Equal([]string{
+			"centralus", "MicrosoftCBLMariner", "azure-linux-3", "azure-linux-3-gen2", "3.20261105.01",
+		}))
+		return (&fake.VirtualMachineImagesAPI{}).Get(ctx, location, publisher, offer, sku, version, opts)
+	}
+	image, err := f.provider.Resolve(f.ctx, f.nodeClass)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(image.ID).To(Equal("MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2:3.20261105.01"))
+	f.opts.EnableFIPS = true
+	_, err = f.provider.Resolve(f.ctx, f.nodeClass)
+	g.Expect(err).To(MatchError(ContainSubstring("without FIPS")))
+}
+
 func TestResolveFlexRejectsUnsupportedPrerequisites(t *testing.T) {
 	cases := []struct {
 		name   string

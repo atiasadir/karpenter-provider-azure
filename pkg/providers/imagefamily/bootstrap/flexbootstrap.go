@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -28,19 +29,22 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 )
 
 const (
-	flexAgentVersion = "v0.3.0"
-	flexBootstrapURL = "https://raw.githubusercontent.com/Azure/AKSFlexNode/4741b41e4feaaca86d0dd53014fd4a141731ea34/scripts/bootstrap.sh"
-	flexBootstrapSHA = "0c00b140a2840dccc08b0bd47daa5f8145d1dfb6a20a2d4434fbea6dcca9523f"
+	flexAgentVersion     = "v0.3.0"
+	flexBootstrapURL     = "https://raw.githubusercontent.com/Azure/AKSFlexNode/4741b41e4feaaca86d0dd53014fd4a141731ea34/scripts/bootstrap.sh"
+	flexBootstrapSHA     = "0c00b140a2840dccc08b0bd47daa5f8145d1dfb6a20a2d4434fbea6dcca9523f"
+	flexAzureLinuxRootFS = "ghcr.io/azure/agent-azlinux3:v20261031@sha256:fd9215a0419f1c4f69ee645dff71245cd1a3354909033eb553076abea94816f5"
 
 	flexOverridesPath = "/etc/aks-flex-node/karpenter-overrides.json"
 	flexKubeletPath   = "/etc/aks-flex-node/karpenter-kubelet.env"
 	flexStartPath     = "/usr/local/sbin/karpenter-flex-bootstrap"
 )
 
-// Flex prepares a dedicated Ubuntu 24.04 host using the pinned Flex Node agent.
+// Flex prepares a dedicated Ubuntu 24.04 or Azure Linux 3 host using the pinned Flex Node agent.
 // The pool, managed identity permissions, and cross-VNet networking must already exist.
 type Flex struct {
 	AgentPoolID             string
@@ -48,6 +52,7 @@ type Flex struct {
 	NodeName                string
 	ProviderID              string
 	Architecture            string
+	ImageFamily             string
 	Labels                  map[string]string
 	Taints                  []corev1.Taint
 	KubeletConfig           *KubeletConfiguration
@@ -71,6 +76,7 @@ type flexOverrides struct {
 		} `json:"machineClient"`
 	} `json:"agent"`
 	Bootstrap struct {
+		OCIImage             string          `json:"ociImage,omitempty"`
 		AdditionalHostMounts []flexHostMount `json:"additionalHostMounts"`
 	} `json:"bootstrap"`
 	Node struct {
@@ -121,6 +127,9 @@ func (f Flex) Script() (string, error) {
 	overrides.Agent.NodeName = f.NodeName
 	overrides.Agent.RequireMachineRegistration = true
 	overrides.Agent.MachineClient.Mode = "arm"
+	if f.ImageFamily == v1beta1.AzureLinuxImageFamily {
+		overrides.Bootstrap.OCIImage = flexAzureLinuxRootFS
+	}
 	// The pinned agent supports host mounts and reads KUBELET_EXTRA_ARGS from
 	// /etc/default/kubelet; there is no Flex node.kubelet.providerID setting.
 	overrides.Bootstrap.AdditionalHostMounts = []flexHostMount{{
@@ -143,10 +152,10 @@ func (f Flex) Script() (string, error) {
 	startScript := fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 . /etc/os-release
-if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
-    echo "Flex bootstrap requires a dedicated Ubuntu 24.04 host" >&2
-    exit 1
-fi
+case %q:"$ID:$VERSION_ID" in
+    Ubuntu2404:ubuntu:24.04|AzureLinux:azurelinux:3.*|AzureLinux:azlinux:3.*) ;;
+    *) echo "Flex host OS does not match the selected image family" >&2; exit 1 ;;
+esac
 case "$(uname -m)" in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
@@ -179,7 +188,7 @@ if [[ -n "$client_id" ]]; then
     args+=(--msi-client-id "$client_id")
 fi
 bash "$script" "${args[@]}"
-`, f.Architecture, flexBootstrapURL, flexBootstrapSHA, flexOverridesPath, flexAgentVersion, archiveSHA)
+`, f.ImageFamily, f.Architecture, flexBootstrapURL, flexBootstrapSHA, flexOverridesPath, flexAgentVersion, archiveSHA)
 
 	config := flexCloudConfig{
 		PackageUpdate: true,
@@ -203,6 +212,9 @@ bash "$script" "${args[@]}"
 }
 
 func (f Flex) validate() (*arm.ResourceID, error) {
+	if !slices.Contains([]string{v1beta1.Ubuntu2404ImageFamily, v1beta1.AzureLinuxImageFamily}, f.ImageFamily) {
+		return nil, fmt.Errorf("unsupported Flex image family %q", f.ImageFamily)
+	}
 	pool, err := arm.ParseResourceID(f.AgentPoolID)
 	if err != nil || pool.Parent == nil || !strings.EqualFold(pool.ResourceType.String(), "Microsoft.ContainerService/managedClusters/agentPools") ||
 		strings.ContainsFunc(f.AgentPoolID, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
