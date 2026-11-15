@@ -560,7 +560,8 @@ var _ = Describe("CloudProvider", func() {
 				Expect(vm.Properties.StorageProfile.ImageReference.Publisher).To(Equal(lo.ToPtr(flex.AzureLinuxHostImagePublisher)))
 				data, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
 				Expect(err).ToNot(HaveOccurred())
-				Expect(string(data)).To(ContainSubstring("agent-azlinux3:v20261031@sha256:"))
+				Expect(string(data)).To(ContainSubstring("oci-layout:///opt/karpenter-flex/rootfs:v20261031"))
+				Expect(string(data)).To(ContainSubstring("92a54e29b67f04a0ea96781dd1e51441715e2d69a059cb4f9f67d6cea5a7eb5a"))
 				Expect(string(data)).To(ContainSubstring(created.Status.ProviderID))
 			})
 

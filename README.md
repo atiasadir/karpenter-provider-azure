@@ -124,6 +124,10 @@ pinned Unbounded release. The bootstrap checks the host's `/etc/os-release`
 against the selected family; running an Azure Linux application container on an
 Ubuntu node does not satisfy this requirement. Fixed system-node OS selection
 remains an AKS node-pool responsibility.
+The Azure Linux rootfs is downloaded as the upstream release's OCI archive,
+SHA256-verified before extraction, and passed through the supported local-layout
+path. This preserves immutable content despite the pinned Unbounded version's
+inability to unpack a registry digest reference.
 
 Before opting in, predeploy and verify:
 

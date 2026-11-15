@@ -180,11 +180,23 @@ func TestFlexScriptChecksHostOSAndRootFS(t *testing.T) {
 					g.Expect(json.Unmarshal([]byte(file.Content), &overrides)).To(Succeed())
 					if tc.family == v1beta1.AzureLinuxImageFamily {
 						g.Expect(overrides.Bootstrap.OCIImage).To(Equal(flexAzureLinuxRootFS))
-						g.Expect(overrides.Bootstrap.OCIImage).To(ContainSubstring("@sha256:"))
+						g.Expect(overrides.Bootstrap.OCIImage).To(HavePrefix("oci-layout://"))
 					} else {
 						g.Expect(overrides.Bootstrap.OCIImage).To(BeEmpty())
 					}
 				case flexStartPath:
+					syntax := exec.Command("bash", "-n")
+					syntax.Stdin = strings.NewReader(file.Content)
+					g.Expect(syntax.Run()).To(Succeed())
+					if tc.family == v1beta1.AzureLinuxImageFamily {
+						g.Expect(file.Content).To(ContainSubstring(flexAzureLinuxRootFSSHA))
+						checksum := strings.Index(file.Content, `"$rootfs_archive" | sha256sum --check --status`)
+						extract := strings.Index(file.Content, `tar -xzf "$rootfs_archive"`)
+						start := strings.Index(file.Content, `bash "$script" "${args[@]}"`)
+						g.Expect(checksum).To(BeNumerically(">", 0))
+						g.Expect(checksum).To(BeNumerically("<", extract))
+						g.Expect(extract).To(BeNumerically("<", start))
+					}
 					guard := strings.Split(file.Content, `case "$(uname -m)"`)[0]
 					guard = strings.Replace(guard, ". /etc/os-release",
 						fmt.Sprintf("ID=%q\nVERSION_ID=%q", tc.osID, tc.version), 1)

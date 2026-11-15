@@ -34,10 +34,12 @@ import (
 )
 
 const (
-	flexAgentVersion     = "v0.3.0"
-	flexBootstrapURL     = "https://raw.githubusercontent.com/Azure/AKSFlexNode/4741b41e4feaaca86d0dd53014fd4a141731ea34/scripts/bootstrap.sh"
-	flexBootstrapSHA     = "0c00b140a2840dccc08b0bd47daa5f8145d1dfb6a20a2d4434fbea6dcca9523f"
-	flexAzureLinuxRootFS = "ghcr.io/azure/agent-azlinux3:v20261031@sha256:fd9215a0419f1c4f69ee645dff71245cd1a3354909033eb553076abea94816f5"
+	flexAgentVersion        = "v0.3.0"
+	flexBootstrapURL        = "https://raw.githubusercontent.com/Azure/AKSFlexNode/4741b41e4feaaca86d0dd53014fd4a141731ea34/scripts/bootstrap.sh"
+	flexBootstrapSHA        = "0c00b140a2840dccc08b0bd47daa5f8145d1dfb6a20a2d4434fbea6dcca9523f"
+	flexAzureLinuxRootFS    = "oci-layout:///opt/karpenter-flex/rootfs:v20261031"
+	flexAzureLinuxRootFSURL = "https://github.com/Azure/unbounded/releases/download/v0.21.0/rootfs-agent-azlinux3-v20261031.oci.tar.gz"
+	flexAzureLinuxRootFSSHA = "92a54e29b67f04a0ea96781dd1e51441715e2d69a059cb4f9f67d6cea5a7eb5a"
 
 	flexOverridesPath = "/etc/aks-flex-node/karpenter-overrides.json"
 	flexKubeletPath   = "/etc/aks-flex-node/karpenter-kubelet.env"
@@ -149,6 +151,18 @@ func (f Flex) Script() (string, error) {
 		return "", fmt.Errorf("marshaling Flex bootstrap overrides: %w", err)
 	}
 
+	rootfsSetup := ""
+	if f.ImageFamily == v1beta1.AzureLinuxImageFamily {
+		// Unbounded v0.21.0 cannot unpack registry digest references. Its tagged
+		// OCI-layout path works without weakening the rootfs content pin.
+		rootfsSetup = fmt.Sprintf(`curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 180 \
+    --output "$rootfs_archive" %q
+printf '%%s  %%s\n' %q "$rootfs_archive" | sha256sum --check --status
+install -d -m 0755 /opt/karpenter-flex/rootfs
+tar -xzf "$rootfs_archive" --directory /opt/karpenter-flex/rootfs
+`, flexAzureLinuxRootFSURL, flexAzureLinuxRootFSSHA)
+	}
+
 	startScript := fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 . /etc/os-release
@@ -167,7 +181,9 @@ if [[ "$arch" != %q ]]; then
 fi
 install -d -m 0700 /run/karpenter-flex-bootstrap
 script=/run/karpenter-flex-bootstrap/bootstrap.sh
-trap 'rm -f "$script"' EXIT
+rootfs_archive=/run/karpenter-flex-bootstrap/rootfs.oci.tar.gz
+trap 'rm -f "$script" "$rootfs_archive"' EXIT
+%s
 curl --fail --silent --show-error --location --retry 5 --connect-timeout 10 --max-time 120 \
     --output "$script" %q
 printf '%%s  %%s\n' %q "$script" | sha256sum --check --status
@@ -188,7 +204,7 @@ if [[ -n "$client_id" ]]; then
     args+=(--msi-client-id "$client_id")
 fi
 bash "$script" "${args[@]}"
-`, f.ImageFamily, f.Architecture, flexBootstrapURL, flexBootstrapSHA, flexOverridesPath, flexAgentVersion, archiveSHA)
+`, f.ImageFamily, f.Architecture, rootfsSetup, flexBootstrapURL, flexBootstrapSHA, flexOverridesPath, flexAgentVersion, archiveSHA)
 
 	config := flexCloudConfig{
 		PackageUpdate: true,
