@@ -48,6 +48,44 @@ selecting policy granted ingress. The synthetic policy was removed after its
 workload. No policy engine was installed or substituted. The remote gate retained
 this limitation rather than reporting policy isolation as PASS.
 
+## Azure Linux live follow-up
+
+Source `63809a69642b5b36e7af615cc9a94c05e3e5c072` also passed the regional
+functional gate with **Azure Linux on every VM host and Kubernetes Node**.
+The existing fixed system pool was migrated using the AKS-supported rolling
+OS SKU update with one surge node; its final state was two Ready Azure Linux 3
+nodes, count two and provisioning state `Succeeded`. No cluster, shared network,
+identity or logical Flex pool was recreated.
+
+The remote host used
+`MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2:3.20261105.01` in Central US.
+ARM guest instance view independently reported `azurelinux`, version `3.0`.
+The remote Kubernetes Node reported Microsoft Azure Linux 3.0 and an Azure Linux
+kernel. Five unchanged synthetic application replicas ran on that single
+four-vCPU worker; only two previously empty scheduling selectors were corrected.
+All five Service endpoints were Ready. The same bidirectional DNS, direct-pod,
+ClusterIP, Service-DNS, node-TCP, logs and exec checks passed.
+
+This run exposed a real dependency limitation: Unbounded v0.21.0 can fetch a
+registry digest reference but its unpacker then looks for that digest as an OCI
+layout tag and fails. The corrected bootstrap downloads the existing upstream
+`rootfs-agent-azlinux3-v20261031.oci.tar.gz` release archive and verifies SHA256
+`92a54e29b67f04a0ea96781dd1e51441715e2d69a059cb4f9f67d6cea5a7eb5a`
+before extraction. Its tagged layout contains the original image index digest
+`sha256:fd9215a0419f1c4f69ee645dff71245cd1a3354909033eb553076abea94816f5`.
+The exact pinned downloader/unpack implementation reproduced the original failure
+and successfully unpacked this verified layout before another worker was launched.
+No mutable-tag check followed by an unverified pull was substituted.
+
+The failed predecessor was removed by normal NodeClaim cleanup; its VM, NIC,
+Machine and NodeClaim were all gone before the successful replacement.
+Unlike the earlier cleanup gates, the successful follow-up worker and application
+were deliberately **left running for inspection**, with no timed teardown.
+Both dynamic pool CPU gates were closed to zero afterward: this bounds further
+allocation but also prevents automatic replacement if the demonstration worker
+is lost. Reopening capacity requires a deliberate, bounded operator action.
+The NetworkPolicy limitation above still applies.
+
 ## Reproduction contract
 
 Follow the [Flex prerequisites and NodeClass configuration](../README.md#experimental-external-vnet-workers).
